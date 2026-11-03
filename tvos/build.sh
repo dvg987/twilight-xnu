@@ -20,7 +20,7 @@ LD="-Wl,-e,_start -Wl,-pagezero_size,0x100000000"
 JOBS=${JOBS-"com.apple.notifyd com.apple.cfprefsd.xpc.daemon com.apple.logd com.apple.syslogd
 	com.apple.distnoted.xpc.daemon com.apple.diagnosticd com.apple.fseventsd com.apple.containermanagerd
 	com.apple.runningboardd com.apple.backboardd com.apple.mobile.usermanagerd com.apple.mobilegestalt.xpc
-	com.apple.lsd com.apple.powerd com.apple.pluginkit.pkd com.apple.Pineboard"}
+	com.apple.lsd com.apple.powerd com.apple.pluginkit.pkd com.apple.Pineboard com.apple.wifid"}
 
 rm -rf $O/root $O/boot
 mkdir -p $O/obj $O/root/{sbin,bin,etc,lib,share,LaunchDaemons,empty,xpc,hal,dev,private/var} \
@@ -52,6 +52,8 @@ done
 if [ -d work/w2fw/bin ]; then
 	mkdir -p $O/root/fw && cp work/w2fw/bin/w2_*.bin $O/root/fw/
 fi
+# the network to join at the start: its name, then its passphrase, one a line (never in the repository)
+[ -f work/w2fw/network ] && mkdir -p $O/root/fw && cp work/w2fw/network $O/root/fw/network
 # our libraries inside tvOS programs (the kernel inserts them: init hands etc/inject.conf to kern.exec_inject).
 # Built against the iOS SDK, then marked tvOS (dyld refuses a library of another platform) and signed again.
 DYN="xnu-clang -arch arm64 -isysroot $THEOS/sdks/iPhoneOS16.5.sdk -O1"
