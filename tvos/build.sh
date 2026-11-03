@@ -59,7 +59,7 @@ fi
 DYN="xnu-clang -arch arm64 -isysroot $THEOS/sdks/iPhoneOS16.5.sdk -O1"
 LDID=$THEOS/toolchain/linux/iphone/bin/ldid
 : > $O/root/etc/inject.conf
-for lib in ${TVLIBS-twlhook:backboardd twlpb:PineBoard}; do
+for lib in ${TVLIBS-twlhook:backboardd twlpb:PineBoard twlbt:TVSettings}; do
 	src=${lib%%:*}; progs=${lib#*:}
 	$DYN -dynamiclib -install_name /redwood/lib/lib$src.dylib -framework IOSurface -framework CoreFoundation -framework IOKit -lobjc -o $O/obj/lib$src.dylib tvos/src/$src.c
 	python3 tools/macho-tvos.py $O/obj/lib$src.dylib
