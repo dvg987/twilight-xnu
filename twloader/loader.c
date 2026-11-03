@@ -157,6 +157,7 @@ static const struct platform platforms[] = {
 };
 
 static const struct platform *P;
+static u64 fb_base, fb_stride, fb_width, fb_height;     /* the platform's, or QEMU's ramfb */
 static struct mbox *MB;
 static int psci_hvc;
 static u64 ram_base, ram_size;
@@ -389,9 +390,9 @@ save_screen(void)
 			MB->shot_at[i] = shot_times[i];
 		}
 	}
-	if (P != NULL && P->fb != 0 && P->mbox != 0) {
-		memcpy((void *)SHOT_PA, (const void *)P->fb, P->fb_stride * P->fb_height);
-		dcache_clean(SHOT_PA, SHOT_PA + P->fb_stride * P->fb_height);
+	if (P != NULL && fb_base != 0 && P->mbox != 0) {
+		memcpy((void *)SHOT_PA, (const void *)fb_base, fb_stride * fb_height);
+		dcache_clean(SHOT_PA, SHOT_PA + fb_stride * fb_height);
 	}
 }
 
@@ -885,11 +886,11 @@ twl_monitor(void)
 		ticks++;
 		monitor_ticks = ticks;
 		dcache_clean((u64)&monitor_ticks, (u64)&monitor_ticks + 8);
-		if (shot_every != 0 && P->fb != 0 && ticks >= shot_from && ticks % shot_every == 0) {
+		if (shot_every != 0 && fb_base != 0 && P->mbox != 0 && ticks >= shot_from && ticks % shot_every == 0) {
 			/* the frame as the display reads it: from RAM, not from what this core may have cached of it */
-			u64 bytes = P->fb_stride * P->fb_height, slot = SHOT_RING_PA + (shots % SHOT_SLOTS) * 0x800000ULL;
-			dcache_inval(P->fb, P->fb + bytes);
-			memcpy((void *)slot, (const void *)P->fb, bytes);
+			u64 bytes = fb_stride * fb_height, slot = SHOT_RING_PA + (shots % SHOT_SLOTS) * 0x800000ULL;
+			dcache_inval(fb_base, fb_base + bytes);
+			memcpy((void *)slot, (const void *)fb_base, bytes);
 			dcache_clean(slot, slot + bytes);
 			shot_times[shots % 32] = ticks;
 			shots++;
@@ -994,6 +995,64 @@ fail(const char *why)
 	finish();
 }
 
+/*
+ * QEMU's ramfb: a display of any size in memory of ours, set through the fw_cfg file "etc/ramfb" (DMA interface).
+ * The same size as the box's screen, 32 bits a pixel.
+ */
+#define FW_CFG_BASE     0x09020000ULL
+
+static void
+ramfb_setup(u64 at)
+{
+	static struct { u64 addr; u32 fourcc, flags, width, height, stride; } __attribute__((packed, aligned(8))) cfg;
+	static volatile struct { u32 control, length; u64 address; } __attribute__((aligned(8))) dma;
+	struct { u32 size; u16 select, reserved; char name[56]; } file;
+	u32 count = 0, select = 0;
+
+	*(volatile u16 *)(FW_CFG_BASE + 8) = __builtin_bswap16(0x19);
+	for (u32 i = 0; i < 4; i++) {
+		((u8 *)&count)[i] = *(volatile u8 *)FW_CFG_BASE;
+	}
+	count = __builtin_bswap32(count);
+	for (u32 i = 0; i < count && i < 512 && select == 0; i++) {
+		for (u32 k = 0; k < sizeof(file); k++) {
+			((u8 *)&file)[k] = *(volatile u8 *)FW_CFG_BASE;
+		}
+		if (str_eq(file.name, "etc/ramfb")) {
+			select = __builtin_bswap16(file.select);
+			print("ramfb: fw_cfg file of %d bytes\n", (u64)__builtin_bswap32(file.size));
+		}
+	}
+	if (select == 0) {
+		print("ramfb: none (start QEMU with -device ramfb)\n");
+		return;
+	}
+	memset((void *)at, 0, 1920 * 4 * 1080);
+	cfg.addr = __builtin_bswap64(at);
+	cfg.fourcc = __builtin_bswap32(0x34325258);     /* 'XR24' */
+	cfg.flags = 0;
+	cfg.width = __builtin_bswap32(1920);
+	cfg.height = __builtin_bswap32(1080);
+	cfg.stride = __builtin_bswap32(1920 * 4);
+	dma.control = __builtin_bswap32(select << 16 | 0x08 | 0x10);
+	dma.length = __builtin_bswap32(sizeof(cfg));
+	dma.address = __builtin_bswap64((u64)&cfg);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	*(volatile u32 *)(FW_CFG_BASE + 16) = __builtin_bswap32((u32)((u64)&dma >> 32));
+	*(volatile u32 *)(FW_CFG_BASE + 20) = __builtin_bswap32((u32)(u64)&dma);
+	for (u32 spin = 0; dma.control != 0 && spin < 10000000; spin++) {
+	}
+	if (dma.control != 0) {
+		print("ramfb: the request did not complete (control %x, select %x)\n", (u64)__builtin_bswap32(dma.control), (u64)select);
+		return;
+	}
+	fb_base = at;
+	fb_stride = 1920 * 4;
+	fb_width = 1920;
+	fb_height = 1080;
+	print("ramfb: 1920x1080 at %x\n", at);
+}
+
 void
 twl_main(u64 fdt_pa, u64 image_base)
 {
@@ -1024,6 +1083,10 @@ twl_main(u64 fdt_pa, u64 image_base)
 		ram_size = fdt_cells(v + 8, 2);
 	}
 	u64 mbox = P->mbox ? P->mbox : ram_base + ram_size - MBOX_SIZE;
+	fb_base = P->fb;
+	fb_stride = P->fb_stride;
+	fb_width = P->fb_width;
+	fb_height = P->fb_height;
 	MB = (struct mbox *)mbox;
 	u64 boots = MB->magic == MBOX_MAGIC ? MB->boots : 0;
 	memset(MB, 0, 0x1000);
@@ -1061,6 +1124,11 @@ twl_main(u64 fdt_pa, u64 image_base)
 		take(P->fixed[i].base, P->fixed[i].size);
 	}
 	take(mbox, MBOX_SIZE);
+	if (P->fb == 0 && P->uart != 0) {
+		/* QEMU: ramfb in the 16 MB below the mailbox */
+		ramfb_setup(mbox - 0x1000000ULL);
+		take(mbox - 0x1000000ULL, 0x1000000ULL);
+	}
 	take(image_base & ~0xfffULL, (u64)(_image_end - _start) + 0x2000);
 	take(rd_start & ~0xfffULL, rd_end - (rd_start & ~0xfffULL) + 0x1000);
 	if (fdt_pa) {
@@ -1156,12 +1224,12 @@ twl_main(u64 fdt_pa, u64 image_base)
 	ba->memSize = win_size;
 	ba->memSizeActual = win_size;
 	ba->topOfKernelData = top;
-	if (P->fb != 0) {
-		ba->video.v_baseAddr = P->fb;
+	if (fb_base != 0) {
+		ba->video.v_baseAddr = fb_base;
 		ba->video.v_display = cmdline_has(pl.cmdline, "-v") ? 0 : 1;
-		ba->video.v_rowBytes = P->fb_stride;
-		ba->video.v_width = P->fb_width;
-		ba->video.v_height = P->fb_height;
+		ba->video.v_rowBytes = fb_stride;
+		ba->video.v_width = fb_width;
+		ba->video.v_height = fb_height;
 		ba->video.v_depth = 32;
 	}
 	struct line l = { ba->commandLine, 0 };
