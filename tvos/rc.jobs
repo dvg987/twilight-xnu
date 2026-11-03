@@ -1,1 +1,2 @@
-# the job list of com.hakios.demo: nothing yet
+# the job list of com.hakios.demo (run by init, line by line)
+/redwood/bin/keys /redwood/etc/keys.list

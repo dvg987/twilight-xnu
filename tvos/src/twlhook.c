@@ -314,6 +314,10 @@ my_make_buffer_current(void *context, void *surface)
 	return r;
 }
 
+#include <stdlib.h>
+#include <stdbool.h>
+#include "twlinput.inc"
+
 __attribute__((constructor)) static void
 twl_init(void)
 {
@@ -335,6 +339,7 @@ twl_init(void)
 	    my_update_surface);
 	make_buffer_current_o = replace_virtual("SWContext make_buffer_current", VSLOT(0x1cf1b1f48UL, 0x348), 0x189aa2b34UL,
 	    my_make_buffer_current);
+	start_keys();
 	/* the server is a CA::WindowServer::EAGLServer (an IOMFBServer that renders with OpenGL ES, or without it in software) */
 	render_update_o = replace_virtual("EAGLServer render_update", VSLOT(0x1cf199958UL, 0x178), 0x189a07350UL, my_render_update);
 	renderer_o = replace_virtual("EAGLServer renderer", VSLOT(0x1cf199958UL, 0x1a0), 0x189a074f8UL, my_renderer);

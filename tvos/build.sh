@@ -32,9 +32,12 @@ $CC -c $H/libmini/start.S -o $O/obj/start.o
 for prog in init child stage0; do
 	$CC -I$H/libmini $LD -o $O/obj/$prog $H/src/$prog.c $O/obj/mini.o $O/obj/start.o
 done
+$CC -I$H/libmini $LD -o $O/obj/keys tvos/src/keys.c $O/obj/mini.o $O/obj/start.o
 
 cp $O/obj/init $O/root/sbin/init
 cp $O/obj/child $O/root/bin/child
+cp $O/obj/keys $O/root/bin/keys
+cp ${KEYS:-tvos/keys.list} $O/root/etc/keys.list
 cp $O/obj/stage0 $O/boot/sbin/launchd
 cp $H/rc.launchd $O/root/etc/rc
 cp ${RC_JOBS:-tvos/rc.jobs} $O/root/etc/rc.jobs
@@ -46,7 +49,7 @@ LDID=$THEOS/toolchain/linux/iphone/bin/ldid
 : > $O/root/etc/inject.conf
 for lib in ${TVLIBS-twlhook:backboardd}; do
 	src=${lib%%:*}; progs=${lib#*:}
-	$DYN -dynamiclib -install_name /redwood/lib/lib$src.dylib -framework IOSurface -framework CoreFoundation -o $O/obj/lib$src.dylib tvos/src/$src.c
+	$DYN -dynamiclib -install_name /redwood/lib/lib$src.dylib -framework IOSurface -framework CoreFoundation -framework IOKit -o $O/obj/lib$src.dylib tvos/src/$src.c
 	python3 tools/macho-tvos.py $O/obj/lib$src.dylib
 	$LDID -S $O/obj/lib$src.dylib
 	cp $O/obj/lib$src.dylib $O/root/lib/
