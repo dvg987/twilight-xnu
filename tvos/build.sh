@@ -80,7 +80,7 @@ python3 -c "import sys; sys.stdout.buffer.write(bytes((i*31 + (i>>8)) & 0xff for
 echo "tvOS on twilight: image built $(date '+%Y-%m-%d %H:%M')" > $O/root/etc/motd
 # the job that runs etc/rc.jobs once launchd is up
 cp $H/com.hakios.demo.plist $O/root/LaunchDaemons/
-ALLOW="bluetooth ${ALLOW:-}" OSLOG=${OSLOG-com.apple.backboardd} python3 $H/mkjobs.py ${REST:+--rest} $ROOTFS $O/root/LaunchDaemons $JOBS
+ALLOW="bluetooth BTServer ${ALLOW:-}" OSLOG=${OSLOG-com.apple.backboardd} python3 $H/mkjobs.py ${REST:+--rest} $ROOTFS $O/root/LaunchDaemons $JOBS
 # Darwin's Bluetooth on the W2 (w2bt=3): BlueTool is our stand-in (the kernel boots the controller), and bluetoothd
 # takes the UART's plain kernel control (com.apple.uart.bluetooth), not the Skywalk one it would by default
 python3 - $O/root/LaunchDaemons <<'PY'
