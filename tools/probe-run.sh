@@ -10,7 +10,7 @@ fastboot boot "$IMG" 2>&1 | tail -1
 sleep 5
 for i in $(seq 1 $WAIT); do
 	if fastboot devices | grep -q .; then echo "landed: fastboot (${i}s)"; exit 0; fi
-	if adb devices | grep -q 'device$'; then echo "landed: android (${i}s) reason=$(adb shell getprop ro.boot.bootreason)"; exit 2; fi
+	if adb devices | grep -v '^emulator-' | grep -q 'device$'; then echo "landed: android (${i}s) reason=$(adb shell getprop ro.boot.bootreason)"; exit 2; fi
 	sleep 1
 done
 echo "landed: nowhere after ${WAIT}s"; exit 3

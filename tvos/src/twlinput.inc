@@ -80,8 +80,16 @@ num(int v)
 	return CFNumberCreate(NULL, kCFNumberIntType, &v);
 }
 
+/*
+ * The remote is told to be Apple's own: PineBoard takes a sender for a Siri Remote by its vendor and product
+ * (TVSBluetoothRemoteTypeForVendorIDAndProductID: 0x004c with 0x0266, 0x026d, 0x0314 or 0x0315; 0x0315 is the
+ * Siri Remote of 2021, type 5), over Bluetooth LE as that one is.
+ */
+#define APPLE_VENDOR            0x004c
+#define SIRI_REMOTE_2021        0x0315
+
 static IOHIDServiceClientRef
-make_keys(IOHIDEventSystemClientRef client, const char *product, int page, int usage)
+make_keys(IOHIDEventSystemClientRef client, const char *product, int page, int usage, bool apple_remote)
 {
 	struct service *made = calloc(1, sizeof(*made));
 	CFMutableDictionaryRef p = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
@@ -98,11 +106,19 @@ make_keys(IOHIDEventSystemClientRef client, const char *product, int page, int u
 	CFDictionarySetValue(p, CFSTR("DeviceUsage"), us);
 	CFDictionarySetValue(p, CFSTR("DeviceUsagePairs"), pairs);
 	CFDictionarySetValue(p, CFSTR("Built-In"), kCFBooleanTrue);
-	CFDictionarySetValue(p, CFSTR("Transport"), CFSTR("USB"));
-	CFDictionarySetValue(p, CFSTR("Manufacturer"), CFSTR("twilight"));
-	CFDictionarySetValue(p, CFSTR("Product"), CFStringCreateWithCString(NULL, product, kCFStringEncodingUTF8));
-	CFDictionarySetValue(p, CFSTR("VendorID"), zero);
-	CFDictionarySetValue(p, CFSTR("ProductID"), zero);
+	if (apple_remote) {
+		CFDictionarySetValue(p, CFSTR("Transport"), CFSTR("BluetoothLowEnergy"));
+		CFDictionarySetValue(p, CFSTR("Manufacturer"), CFSTR("Apple Inc."));
+		CFDictionarySetValue(p, CFSTR("Product"), CFSTR("Siri Remote"));
+		CFDictionarySetValue(p, CFSTR("VendorID"), num(APPLE_VENDOR));
+		CFDictionarySetValue(p, CFSTR("ProductID"), num(SIRI_REMOTE_2021));
+	} else {
+		CFDictionarySetValue(p, CFSTR("Transport"), CFSTR("USB"));
+		CFDictionarySetValue(p, CFSTR("Manufacturer"), CFSTR("twilight"));
+		CFDictionarySetValue(p, CFSTR("Product"), CFStringCreateWithCString(NULL, product, kCFStringEncodingUTF8));
+		CFDictionarySetValue(p, CFSTR("VendorID"), zero);
+		CFDictionarySetValue(p, CFSTR("ProductID"), zero);
+	}
 	made->properties = p;
 	for (int attempt = 1; attempt <= 6; attempt++) {
 		made->opened = false;
@@ -150,9 +166,9 @@ keys_thread(void *arg)
 			continue;
 		}
 		IOHIDEventSystemClientScheduleWithDispatchQueue(client, dispatch_queue_create("twilight.keys", NULL));
-		keyboard = make_keys(client, "twilight keyboard", 0x01, 0x06);  /* generic desktop: keyboard */
+		keyboard = make_keys(client, "twilight keyboard", 0x01, 0x06, false);  /* generic desktop: keyboard */
 		if (keyboard != NULL) {
-			remote = make_keys(client, "twilight remote", 0x0c, 0x01);      /* consumer control */
+			remote = make_keys(client, "twilight remote", 0x0c, 0x01, true);        /* consumer control */
 		} else {
 			say("twl: input: a HID client of type %d may not make services\n", type);
 		}
