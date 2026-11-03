@@ -48,6 +48,10 @@ cp work/tvos/var.skel $O/root/etc/var.skel
 	case $f in mobile/*) id=501;; *) id=0;; esac
 	printf 'f\t600\t%d\t%d\t/private/var/%s\t/etc/var/%s\n' $id $id "$f" "$f" >> $O/root/etc/var.skel
 done
+# the W2's Wi-Fi firmware for the kernel (fw/ of the small image; tools/w2-fw.py makes it from CoreELEC's file)
+if [ -d work/w2fw/bin ]; then
+	mkdir -p $O/root/fw && cp work/w2fw/bin/w2_*.bin $O/root/fw/
+fi
 # our libraries inside tvOS programs (the kernel inserts them: init hands etc/inject.conf to kern.exec_inject).
 # Built against the iOS SDK, then marked tvOS (dyld refuses a library of another platform) and signed again.
 DYN="xnu-clang -arch arm64 -isysroot $THEOS/sdks/iPhoneOS16.5.sdk -O1"
