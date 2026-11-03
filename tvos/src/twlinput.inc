@@ -99,7 +99,7 @@ make_keys(IOHIDEventSystemClientRef client, const char *product, int page, int u
 	CFDictionarySetValue(p, CFSTR("VendorID"), zero);
 	CFDictionarySetValue(p, CFSTR("ProductID"), zero);
 	made->properties = p;
-	for (int attempt = 1; attempt <= 20; attempt++) {
+	for (int attempt = 1; attempt <= 6; attempt++) {
 		made->opened = false;
 		s = IOHIDVirtualServiceClientCreateWithCallbacks(client, p, &svc_callbacks, NULL, made);
 		if (s == NULL) {
@@ -136,17 +136,22 @@ keys_thread(void *arg)
 		return NULL;
 	}
 	sleep(3);
-	client = IOHIDEventSystemClientCreateWithType(NULL, 4 /* simple */, NULL);
-	if (client == NULL) {
-		client = IOHIDEventSystemClientCreateWithType(NULL, 3, NULL);
+	keyboard = remote = NULL;
+	/* a client of the event system that may make services: "simple" first, then the rate-controlled kind */
+	for (int type = 4; type >= 3 && keyboard == NULL; type--) {
+		client = IOHIDEventSystemClientCreateWithType(NULL, type, NULL);
+		if (client == NULL) {
+			say("twl: input: no HID client of type %d\n", type);
+			continue;
+		}
+		IOHIDEventSystemClientScheduleWithDispatchQueue(client, dispatch_queue_create("twilight.keys", NULL));
+		keyboard = make_keys(client, "twilight keyboard", 0x01, 0x06);  /* generic desktop: keyboard */
+		if (keyboard != NULL) {
+			remote = make_keys(client, "twilight remote", 0x0c, 0x01);      /* consumer control */
+		} else {
+			say("twl: input: a HID client of type %d may not make services\n", type);
+		}
 	}
-	if (client == NULL) {
-		say("twl: input: no HID client\n");
-		return NULL;
-	}
-	IOHIDEventSystemClientScheduleWithDispatchQueue(client, dispatch_queue_create("twilight.keys", NULL));
-	keyboard = make_keys(client, "twilight keyboard", 0x01, 0x06);  /* generic desktop: keyboard */
-	remote = make_keys(client, "twilight remote", 0x0c, 0x01);      /* consumer control */
 	say("twl: input: keyboard %p, remote %p\n", (void *)keyboard, (void *)remote);
 	while (read(device, &t, sizeof(t)) == (ssize_t)sizeof(t)) {
 		uint32_t page = t.finger >> 16, usage = t.finger & 0xffff;

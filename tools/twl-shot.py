@@ -12,10 +12,10 @@ W, H = 1920, 1080
 def grab(pa, out):
     buf = io.BytesIO()
     rx(f'dd if=/dev/mem bs=1M skip={pa >> 20} count=8 2>/dev/null', out=buf)
-    if '--bpp32' in sys.argv:
+    if '--bpp24' not in sys.argv:
         raw = buf.getvalue()[:W * H * 4]
         img = Image.frombuffer('RGBA', (W, H), raw, 'raw', 'BGRA', 0, 1).convert('RGB')
-    else:   # the box's panel: B G R, 5760 bytes a row
+    else:   # a 24-bit frame: B G R, 5760 bytes a row
         raw = buf.getvalue()[:W * H * 3]
         img = Image.frombuffer('RGB', (W, H), raw, 'raw', 'BGR', 0, 1)
     if '--half' in sys.argv:

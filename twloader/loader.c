@@ -127,6 +127,7 @@ struct platform {
 	u64 fb, fb_stride;              /* the firmware's framebuffer, 0: none */
 	u32 fb_width, fb_height;
 	int cores, core_shift, monitor;
+	u64 osd_fb;                     /* != 0: reprogram the Amlogic OSD1 to scan 32-bit ARGB from here */
 	struct range fixed[6];          /* RAM that is never the kernel's */
 	u64 mbox;                       /* 0: the top 16 MB of RAM */
 };
@@ -136,11 +137,12 @@ static const struct platform platforms[] = {
 		.name = "twilight", .match = "s7d",
 		.io_base = 0xf0000000, .io_size = 0x10000000,
 		.gicd = 0xfff01000, .gicd_size = 0x1000, .gicc = 0xfff02000, .gicc_size = 0x2000,
-		.fb = 0x1f800000, .fb_stride = 1920 * 4, .fb_width = 1920, .fb_height = 1080,
+		.fb = 0x6e000000, .fb_stride = 1920 * 4, .fb_width = 1920, .fb_height = 1080, .osd_fb = 0x6e000000,
 		.cores = 4, .core_shift = 8, .monitor = 1,
 		.fixed = {
 			{ 0x00000000, 0x07500000 },     /* U-Boot's own, the secure monitor and TEE, ramoops */
-			{ 0x1f800000, 0x00800000 },     /* the framebuffer the display scans out */
+			{ 0x1f800000, 0x00800000 },     /* U-Boot's framebuffer (16 bits, too small for 32) */
+			{ 0x6e000000, 0x01000000 },     /* ours: 1920x1080, 32 bits */
 			{ 0x6f000000, 0x01000000 },     /* the mailbox */
 			{ 0x70000000, 0x0f000000 },     /* the last frame, saved on the way back, and the monitor's time-lapse */
 			{ 0x7f000000, 0x01000000 },     /* the secure world's at the top */
@@ -1056,6 +1058,30 @@ ramfb_setup(u64 at)
 	print("ramfb: 1920x1080 at %x\n", at);
 }
 
+/*
+ * U-Boot leaves the box's OSD1 scanning a 16-bit frame (RGB565, 3840 bytes a row) in linear-address mode. Make it
+ * 32-bit ARGB (B, G, R, A in memory: what the window server draws), 7680 bytes a row, from a frame of our own.
+ * VCBUS registers at 0xff000000 + index * 4 (Amlogic's osd_hw.c: osd_update_mif_linear_addr, osd_update_color_mode).
+ */
+#define VCBUS(reg)      (*(volatile u32 *)(0xff000000UL + (reg) * 4))
+#define VIU_OSD1_BLK1_CFG_W4    0x1a14  /* the frame's address >> 4 */
+#define VIU_OSD1_BLK2_CFG_W4    0x1a15  /* [11:0] line stride in 16 bytes */
+#define VIU_OSD1_BLK0_CFG_W0    0x1a1b  /* [11:8] block mode (5 = 32 bits), [5:2] colour matrix (1 = ARGB) */
+
+static void
+osd_setup(u64 fb)
+{
+	u32 w0 = VCBUS(VIU_OSD1_BLK0_CFG_W0), stride = VCBUS(VIU_OSD1_BLK2_CFG_W4);
+
+	print("osd1: was %x a frame at %x, stride %d bytes, cfg %x\n", (u64)((w0 >> 8) & 0xf),
+	    (u64)VCBUS(VIU_OSD1_BLK1_CFG_W4) << 4, (u64)(stride & 0xfff) * 16, (u64)w0);
+	memset((void *)fb, 0, 1920 * 4 * 1080);
+	VCBUS(VIU_OSD1_BLK1_CFG_W4) = (u32)(fb >> 4);
+	VCBUS(VIU_OSD1_BLK2_CFG_W4) = (stride & ~0xfffu) | (1920 * 4 / 16);
+	VCBUS(VIU_OSD1_BLK0_CFG_W0) = (w0 & ~0xf3cu) | 5u << 8 | 1u << 2;
+	print("osd1: now 32-bit ARGB at %x, cfg %x\n", fb, (u64)VCBUS(VIU_OSD1_BLK0_CFG_W0));
+}
+
 void
 twl_main(u64 fdt_pa, u64 image_base)
 {
@@ -1101,6 +1127,9 @@ twl_main(u64 fdt_pa, u64 image_base)
 	print("\ntwloader for HakiOS on %s (FDT compatible \"%s\"), EL%d, core %x, image at %x\n", P->name, compat,
 	    current_el(), read_mpidr() & 0xffffff, image_base);
 	print("RAM %x..%x, mailbox %x (run %d)\n", ram_base, ram_base + ram_size, mbox, MB->boots);
+	if (P->osd_fb != 0) {
+		osd_setup(P->osd_fb);
+	}
 
 	if (fdt_open(&f, fdt_pa) && (v = fdt_prop(&f, "/psci", "method", &len)) != NULL) {
 		psci_hvc = str_eq((const char *)v, "hvc");
