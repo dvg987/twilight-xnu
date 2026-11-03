@@ -2,7 +2,12 @@
 # Boot the rescue Linux from fastboot and wait until its shell server answers.
 cd "$(dirname "$0")/.."
 for i in $(seq 1 60); do fastboot devices | grep -q . && break; sleep 1; done
-fastboot boot out/rescue.img >/dev/null 2>&1 || { echo "fastboot boot failed"; exit 1; }
+ok=
+for t in 1 2 3 4 5; do
+	sleep 2
+	fastboot boot out/rescue.img >/dev/null 2>&1 && { ok=1; break; }
+done
+[ -n "$ok" ] || { echo "fastboot boot failed" >&2; exit 1; }
 for i in $(seq 1 60); do
 	if ip link show enp0s20f0u4 >/dev/null 2>&1; then nmcli con up twrescue >/dev/null 2>&1 && break; fi
 	sleep 1

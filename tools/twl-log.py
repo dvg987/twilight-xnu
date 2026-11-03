@@ -10,7 +10,7 @@ from rx import rx
 MBOX = 0x6f000000
 STATES = ['none', 'loader', 'kernel running', 'kernel returned', 'HUNG (monitor)', 'loader failed', 'EL2 trap']
 FIELDS = ['magic', 'boots', 'state', 'reason'] + [f'r{i}' for i in range(8)] + ['llog_len', 'klog_len', 'phys_base',
-          'mem_size', 'slide', 'kernel_live_pa', 'heartbeat', 'monitor_seconds', 'hang_seconds', 't_loader', 't_kernel']
+          'mem_size', 'slide', 'kernel_live_pa', 'heartbeat', 'monitor_seconds', 'hang_seconds', 't_loader', 't_kernel', 'shots', 'shot_every', 'shot_from'] + [f'shot{i}' for i in range(32)]
 
 def read(addr, size):
     buf = io.BytesIO()
@@ -25,6 +25,7 @@ def main():
         print(f"no mailbox at {MBOX:#x} (magic {v['magic']:#x})"); return 1
     st = STATES[v['state']] if v['state'] < len(STATES) else v['state']
     print(f"run {v['boots']}: {st}; reason {v['reason']:#x} regs {' '.join(hex(v[f'r{i}']) for i in range(6))}")
+    print(f"time-lapse: {v['shots']} frames, every {v['shot_every']} s; the monitor ran {v['monitor_seconds']} s")
     print(f"window {v['phys_base']:#x}+{v['mem_size']:#x}, heartbeat {v['heartbeat']}, "
           f"kernel ran {(v['t_kernel'] and 1) and ''}loader log {v['llog_len']} B, kernel log {v['klog_len']} B")
     llog = read(MBOX + 0x1000, min(v['llog_len'], 0xff000)) if v['llog_len'] else b''

@@ -9,4 +9,5 @@ tools/probe-run.sh out/twl.img "$WAIT" || { echo "the box did not come back to f
 tools/rescue-up.sh >/dev/null || exit 1
 D=logs/run-$(date +%m%d-%H%M%S)
 python3 tools/twl-log.py --save "$D" > "$D.txt" 2>&1
-head -4 "$D.txt"; echo "saved: $D.txt"
+python3 tools/twl-shot.py "$D.png" --half --slots ${SLOTS:-10} >/dev/null 2>&1
+head -4 "$D.txt"; echo "saved: $D.txt $D.png"

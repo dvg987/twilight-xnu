@@ -105,7 +105,15 @@ struct mbox {
 	u64 phys_base, mem_size, slide, kernel_live_pa;
 	u64 heartbeat, monitor_seconds, hang_seconds;
 	u64 t_loader, t_kernel;         /* counter values at loader start and kernel entry */
+	u64 shots, shot_every, shot_from;       /* the monitor's time-lapse: slots taken, seconds apart, from second */
+	u64 shot_at[32];                /* seconds since the kernel's entry, per slot (a ring) */
 };
+#define SHOT_RING_PA    0x70800000ULL   /* slot n at SHOT_RING_PA + n * 8 MB, up to 0x7f000000 */
+#define SHOT_SLOTS      10              /* (the rescue Linux uses the RAM above 0x75800000) */
+/* kept by the monitor while the kernel runs (never in the mailbox then), put there on the way back */
+static volatile u64 shot_times[32] __attribute__((aligned(64)));
+static volatile u64 shot_count __attribute__((aligned(64)));
+static volatile u64 monitor_ticks __attribute__((aligned(64)));
 
 /* ------------------------------------------------------------------------ */
 /* Platforms                                                                */
@@ -134,6 +142,7 @@ static const struct platform platforms[] = {
 			{ 0x00000000, 0x07500000 },     /* U-Boot's own, the secure monitor and TEE, ramoops */
 			{ 0x1f800000, 0x00800000 },     /* the framebuffer the display scans out */
 			{ 0x6f000000, 0x01000000 },     /* the mailbox */
+			{ 0x70000000, 0x0f000000 },     /* the last frame, saved on the way back, and the monitor's time-lapse */
 			{ 0x7f000000, 0x01000000 },     /* the secure world's at the top */
 		},
 		.mbox = 0x6f000000,
@@ -365,10 +374,32 @@ psci(u64 fn, u64 a1, u64 a2, u64 a3)
 	return psci_hvc ? hvc_call(fn, a1, a2, a3) : smc_call(fn, a1, a2, a3);
 }
 
+/* The last frame on the screen, where the rescue Linux reads it back (tools/twl-shot.py): outside the kernel's window. */
+#define SHOT_PA 0x70000000ULL
+
+static void
+save_screen(void)
+{
+	if (MB != NULL) {
+		dcache_inval((u64)shot_times, (u64)shot_times + sizeof(shot_times) + 64);
+		MB->shots = shot_count;
+		dcache_inval((u64)&monitor_ticks, (u64)&monitor_ticks + 8);
+		MB->monitor_seconds = monitor_ticks;
+		for (int i = 0; i < 32; i++) {
+			MB->shot_at[i] = shot_times[i];
+		}
+	}
+	if (P != NULL && P->fb != 0 && P->mbox != 0) {
+		memcpy((void *)SHOT_PA, (const void *)P->fb, P->fb_stride * P->fb_height);
+		dcache_clean(SHOT_PA, SHOT_PA + P->fb_stride * P->fb_height);
+	}
+}
+
 /* Back to the firmware: on the box into fastboot with RAM kept, under QEMU off. */
 static void __attribute__((noreturn))
 finish(void)
 {
+	save_screen();
 	dcache_clean((u64)MB, (u64)MB + MBOX_SIZE);
 	if (P->monitor) {
 		psci(PSCI_SYSTEM_RESET, AML_REASON_BOOTLOADER, 0, 0);
@@ -485,8 +516,8 @@ fdt_cells(const u8 *v, u32 cells)
 /* Payload                                                                  */
 
 struct payload {
-	const u8 *kernel, *ramdisk;
-	u64 kernel_size, ramdisk_size;
+	const u8 *kernel, *ramdisk, *ramdisk1;
+	u64 kernel_size, ramdisk_size, ramdisk1_size;
 	const char *cmdline, *version;
 };
 
@@ -523,6 +554,8 @@ parse_payload(struct payload *pl, u64 addr, u64 size)
 			pl->kernel = data; pl->kernel_size = len;
 		} else if (str_eq(name, "ramdisk")) {
 			pl->ramdisk = data; pl->ramdisk_size = len;
+		} else if (str_eq(name, "ramdisk1")) {
+			pl->ramdisk1 = data; pl->ramdisk1_size = len;
 		} else if (str_eq(name, "cmdline")) {
 			pl->cmdline = (const char *)data;
 		} else if (str_eq(name, "kernel.ver")) {
@@ -833,6 +866,7 @@ twl_monitor(void)
 	u64 hang_seconds;
 	dcache_inval((u64)MB, (u64)MB + 0x1000);
 	hang_seconds = MB->hang_seconds;
+	u64 shot_every = MB->shot_every, shot_from = MB->shot_from, shots = 0, ticks = 0;
 	for (;;) {
 		u64 t0 = read_cntpct();
 		while (read_cntpct() - t0 < freq) {
@@ -847,6 +881,20 @@ twl_monitor(void)
 		if (state != ST_KERNEL) {
 			last_change = read_cntpct();
 			continue;
+		}
+		ticks++;
+		monitor_ticks = ticks;
+		dcache_clean((u64)&monitor_ticks, (u64)&monitor_ticks + 8);
+		if (shot_every != 0 && P->fb != 0 && ticks >= shot_from && ticks % shot_every == 0) {
+			/* the frame as the display reads it: from RAM, not from what this core may have cached of it */
+			u64 bytes = P->fb_stride * P->fb_height, slot = SHOT_RING_PA + (shots % SHOT_SLOTS) * 0x800000ULL;
+			dcache_inval(P->fb, P->fb + bytes);
+			memcpy((void *)slot, (const void *)P->fb, bytes);
+			dcache_clean(slot, slot + bytes);
+			shot_times[shots % 32] = ticks;
+			shots++;
+			shot_count = shots;
+			dcache_clean((u64)shot_times, (u64)shot_times + sizeof(shot_times) + 64);
 		}
 		u64 beat = live_pa ? live_pa->heartbeat : 0;
 		u64 len = live_pa ? *(volatile u32 *)(live_pa->log_len + live_slide) : 0;
@@ -1056,7 +1104,8 @@ twl_main(u64 fdt_pa, u64 image_base)
 	u64 slide = phys_base - KERNEL_VIRT_BASE;
 	u64 kern_lo = vm_lo + slide, kern_hi = (vm_hi + slide + PAGE_SIZE_MAX - 1) & ~(PAGE_SIZE_MAX - 1);
 	u64 rd_pa = kern_hi, rd_size = (pl.ramdisk_size + PAGE_SIZE_MAX - 1) & ~(PAGE_SIZE_MAX - 1);
-	u64 dt_pa = rd_pa + rd_size, dt_max = 0x40000, ba_pa = dt_pa + dt_max;
+	u64 rd1_pa = rd_pa + rd_size, rd1_size = (pl.ramdisk1_size + PAGE_SIZE_MAX - 1) & ~(PAGE_SIZE_MAX - 1);
+	u64 dt_pa = rd1_pa + rd1_size, dt_max = 0x40000, ba_pa = dt_pa + dt_max;
 	u64 pram_pa = ba_pa + PAGE_SIZE_MAX, top = pram_pa + PANIC_LOG_SIZE;
 	if (top - phys_base + 0x4000000ULL > win_size) {
 		fail("the kernel and its RAM disk do not fit");
@@ -1075,6 +1124,11 @@ twl_main(u64 fdt_pa, u64 image_base)
 		memset((void *)rd_pa, 0, rd_size);
 		memcpy((void *)rd_pa, pl.ramdisk, pl.ramdisk_size);
 		print("RAM disk at %x, %x bytes\n", rd_pa, pl.ramdisk_size);
+	}
+	if (rd1_size != 0) {
+		memset((void *)rd1_pa, 0, rd1_size);
+		memcpy((void *)rd1_pa, pl.ramdisk1, pl.ramdisk1_size);
+		print("second RAM disk at %x, %x bytes\n", rd1_pa, pl.ramdisk1_size);
 	}
 	memset((void *)pram_pa, 0, PANIC_LOG_SIZE);
 
@@ -1186,6 +1240,10 @@ twl_main(u64 fdt_pa, u64 image_base)
 		u64 disk[2] = { rd_pa, rd_size };
 		dt_prop(&w, "RAMDisk", disk, sizeof(disk));
 	}
+	if (rd1_size != 0) {
+		u64 disk1[2] = { rd1_pa, rd1_size };
+		dt_prop(&w, "RAMDisk1", disk1, sizeof(disk1));
+	}
 	dt_end(&w);
 	dt_end(&w);
 
@@ -1270,6 +1328,8 @@ twl_main(u64 fdt_pa, u64 image_base)
 	MB->slide = slide;
 	MB->kernel_live_pa = (u64)live_pa;
 	MB->hang_seconds = cmdline_number(pl.cmdline, "twl_hang=", 60);
+	MB->shot_every = cmdline_number(pl.cmdline, "twl_shot=", 15);
+	MB->shot_from = cmdline_number(pl.cmdline, "twl_shot_from=", 0);
 	if (P->monitor && !cmdline_has(pl.cmdline, "twl_monitor=0")) {
 		start_monitor();
 	}

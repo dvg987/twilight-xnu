@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Run a shell command on the rescue Linux over its telnetd (USB RNDIS) and print the output."""
-import socket, sys, time, uuid
+import re, socket, sys, time, uuid
 
 HOST = '192.168.77.1'
 
@@ -26,23 +26,22 @@ def run(cmd, timeout=60):
     time.sleep(0.3)
     s.sendall(b'stty -echo 2>/dev/null; PS1=; export PS1\n')
     s.sendall(f'echo BEGIN{mark}; ( {cmd} ) 2>&1; echo; echo END{mark} $?\n'.encode())
-    data = b''; t0 = time.time()
+    import re
+    done = re.compile(rb'(^|\n)END' + mark.encode() + rb' (\d+)')
+    data = b''
     s.settimeout(timeout)
-    while f'END{mark}'.encode() not in data.split(f'BEGIN{mark}'.encode(), 1)[-1] or data.count(f'BEGIN{mark}'.encode()) < 1:
+    while not done.search(data):
         try:
             chunk = s.recv(65536)
         except socket.timeout:
             break
-        if not chunk: break
-        data += strip_iac(chunk, s)
-        if f'END{mark} '.encode() in data and data.rfind(f'END{mark} '.encode()) > data.rfind(f'BEGIN{mark}'.encode()) and b'\n' in data[data.rfind(f'END{mark} '.encode()):]:
+        if not chunk:
             break
+        data += strip_iac(chunk, s)
     s.close()
     txt = data.decode('utf-8', 'replace').replace('\r', '')
-    b = txt.rfind(f'BEGIN{mark}\n')
-    e = txt.rfind(f'END{mark} ')
-    body = txt[b + len(mark) + 6:e] if b >= 0 and e > b else txt
-    rc = txt[e:].split()[1] if e >= 0 else '?'
+    m = re.search(r'(^|\n)BEGIN' + mark + r'\n(.*?)\nEND' + mark + r' (\d+)', txt, re.S)
+    body, rc = (m.group(2), m.group(3)) if m else (txt, '?')
     return body.rstrip('\n'), rc
 
 if __name__ == '__main__':
