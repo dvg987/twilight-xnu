@@ -1,0 +1,3 @@
+# the job list of com.hakios.demo (run by init, line by line): the keys, and the Metal plug-in self-test
+/redwood/bin/keys /redwood/etc/keys.list
+/redwood/bin/metaltest 1

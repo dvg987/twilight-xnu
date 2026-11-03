@@ -56,6 +56,11 @@ fi
 if [ -f work/malifw/mali_csffw.bin ]; then
 	mkdir -p $O/root/fw && cp work/malifw/mali_csffw.bin $O/root/fw/
 fi
+# the GPU's Metal plug-in (work/metalbuild: MaliMetal's, with PanVK inside), in /System/Library/Extensions through
+# the image's ext/ (init: a union mount); Metal loads it when the kernel's accelerator names it (metal=1)
+if [ -d work/metalbuild/out/NativeMaliMetal.bundle ]; then
+	mkdir -p $O/root/ext && cp -R work/metalbuild/out/NativeMaliMetal.bundle $O/root/ext/
+fi
 # the network to join at the start: its name, then its passphrase, one a line (never in the repository)
 [ -f work/w2fw/network ] && mkdir -p $O/root/fw && cp work/w2fw/network $O/root/fw/network
 # our libraries inside tvOS programs (the kernel inserts them: init hands etc/inject.conf to kern.exec_inject).
@@ -72,7 +77,7 @@ for lib in ${TVLIBS-twlhook:backboardd twlpb:PineBoard twlbt:TVSettings}; do
 	echo "/redwood/lib/lib$src.dylib ${progs//,/ }" >> $O/root/etc/inject.conf
 done
 # programs of ours that are tvOS programs (dyld, libSystem): built the same way
-for prog in bluetool; do
+for prog in bluetool metaltest; do
 	$DYN -o $O/obj/$prog tvos/src/$prog.c
 	python3 tools/macho-tvos.py $O/obj/$prog
 	$LDID -S -Cadhoc $O/obj/$prog          # (ad hoc: what the kernel's AMFI stand-in takes for a platform binary)
