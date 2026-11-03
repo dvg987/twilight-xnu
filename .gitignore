@@ -1,0 +1,10 @@
+refs/
+work/
+out/
+*.img
+device/live-dt/
+device/proc-dt/
+probe/*.o
+probe/*.elf
+probe/*.Image
+probe/dummy-rd.gz

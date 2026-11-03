@@ -1,0 +1,45 @@
+#!/bin/busybox sh
+# Rescue initramfs: root shell over USB (RNDIS 192.168.77.1, telnet 23, nc 5000+), no writes to storage.
+/bin/busybox mkdir -p /bin /sbin /usr/bin /usr/sbin /proc /sys /dev /tmp /mnt /var/run
+/bin/busybox --install -s
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+mkdir -p /dev/pts && mount -t devpts devpts /dev/pts
+mount -t configfs none /sys/kernel/config
+mount -t debugfs none /sys/kernel/debug 2>/dev/null
+mount -t tmpfs tmp /tmp
+log() { echo "rescue: $*" > /dev/kmsg; echo "rescue: $*" > /dev/tty0 2>/dev/null; }
+log "init start"
+
+G=/sys/kernel/config/usb_gadget/g1
+mkdir -p $G
+echo 0x1d6b > $G/idVendor
+echo 0x0104 > $G/idProduct
+mkdir -p $G/strings/0x409
+echo "twilight-rescue" > $G/strings/0x409/product
+echo "twilight-xnu" > $G/strings/0x409/manufacturer
+echo "TWRESCUE01" > $G/strings/0x409/serialnumber
+mkdir -p $G/functions/rndis.usb0
+mkdir -p $G/configs/c.1/strings/0x409
+echo "rndis" > $G/configs/c.1/strings/0x409/configuration
+echo 250 > $G/configs/c.1/MaxPower
+ln -s $G/functions/rndis.usb0 $G/configs/c.1/
+UDC=
+for i in $(seq 1 30); do UDC=$(ls /sys/class/udc 2>/dev/null | head -n1); [ -n "$UDC" ] && break; sleep 1; done
+log "udc=$UDC"
+echo "$UDC" > $G/UDC
+for i in $(seq 1 10); do [ -e /sys/class/net/usb0 ] && break; sleep 1; done
+ifconfig usb0 192.168.77.1 netmask 255.255.255.0 up
+cat > /tmp/udhcpd.conf <<EOC
+start 192.168.77.2
+end 192.168.77.20
+interface usb0
+lease_file /tmp/udhcpd.leases
+option subnet 255.255.255.0
+EOC
+touch /tmp/udhcpd.leases
+udhcpd /tmp/udhcpd.conf
+telnetd -l /bin/sh -p 23
+log "up: telnet 192.168.77.1"
+while true; do sh </dev/tty1 >/dev/tty1 2>&1 || sleep 5; done
