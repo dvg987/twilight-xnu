@@ -3,6 +3,7 @@
 
   twl-keys.py                 interactive: arrows, Enter = select, Esc/Backspace = menu, space = play/pause, h = home, q quits
   twl-keys.py up down select  send these and exit (names: up down left right select menu playpause home, rup ... rmenu)
+  twl-keys.py stop            end the run: the box goes back to the loader, then fastboot
 """
 import os, struct, sys, termios, time, tty
 import usb.core, usb.util
@@ -37,6 +38,9 @@ def main():
         dev.set_configuration()
     except usb.core.USBError:
         pass
+    if sys.argv[1:] == ['stop']:
+        dev.write(0x01, struct.pack('<II', 9, 0x504f5453))
+        return
     if len(sys.argv) > 1:
         for name in sys.argv[1:]:
             press(dev, name)
