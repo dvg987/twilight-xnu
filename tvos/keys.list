@@ -1,7 +1,8 @@
-# a walk through the first screens, for checking the keys before the USB driver
-wait 100
-select
-wait 6
-down
-wait 4
-select
+wait 90
+right
+wait 18
+rright
+wait 18
+rdown
+wait 18
+rselect

@@ -52,6 +52,11 @@ static Boolean
 svc_set_property(void *target, void *refcon, IOHIDServiceClientRef s, CFStringRef key, CFTypeRef value)
 {
 	(void)target, (void)s;
+	if (key != NULL) {
+		char name[96] = "?";
+		CFStringGetCString(key, name, sizeof(name), kCFStringEncodingUTF8);
+		say("twl: input: the event server sets \"%s\" on %p\n", name, refcon);
+	}
 	if (key && value && CFEqual(key, CFSTR("DeviceOpenedByEventSystem")) && CFGetTypeID(value) == CFBooleanGetTypeID() &&
 	    CFBooleanGetValue(value)) {
 		((struct service *)refcon)->opened = true;
@@ -92,7 +97,7 @@ make_keys(IOHIDEventSystemClientRef client, const char *product, int page, int u
 	CFDictionarySetValue(p, CFSTR("DeviceUsagePage"), pg);
 	CFDictionarySetValue(p, CFSTR("DeviceUsage"), us);
 	CFDictionarySetValue(p, CFSTR("DeviceUsagePairs"), pairs);
-	CFDictionarySetValue(p, CFSTR("Built-In"), kCFBooleanFalse);
+	CFDictionarySetValue(p, CFSTR("Built-In"), kCFBooleanTrue);
 	CFDictionarySetValue(p, CFSTR("Transport"), CFSTR("USB"));
 	CFDictionarySetValue(p, CFSTR("Manufacturer"), CFSTR("twilight"));
 	CFDictionarySetValue(p, CFSTR("Product"), CFStringCreateWithCString(NULL, product, kCFStringEncodingUTF8));
@@ -165,6 +170,7 @@ keys_thread(void *arg)
 			say("twl: input: key page %#x usage %#x %s\n", page, usage, t.type == HAKIOS_BUTTON_DOWN ? "down" : "up");
 		}
 		e = IOHIDEventCreateKeyboardEvent(NULL, mach_absolute_time(), page, usage, t.type == HAKIOS_BUTTON_DOWN, 0);
+		IOHIDEventSetIntegerValue(e, 0x4 /* is built in */, 1);
 		IOHIDVirtualServiceClientDispatchEvent(s, e);
 		CFRelease(e);
 	}
