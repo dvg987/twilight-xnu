@@ -52,6 +52,10 @@ done
 if [ -d work/w2fw/bin ]; then
 	mkdir -p $O/root/fw && cp work/w2fw/bin/w2_*.bin $O/root/fw/
 fi
+# the Mali-G310's CSF firmware (mali=2 and up): CoreELEC's arm/mali/arch10.8/mali_csffw.bin, the v10 image Amlogic runs on the S7D
+if [ -f work/malifw/mali_csffw.bin ]; then
+	mkdir -p $O/root/fw && cp work/malifw/mali_csffw.bin $O/root/fw/
+fi
 # the network to join at the start: its name, then its passphrase, one a line (never in the repository)
 [ -f work/w2fw/network ] && mkdir -p $O/root/fw && cp work/w2fw/network $O/root/fw/network
 # our libraries inside tvOS programs (the kernel inserts them: init hands etc/inject.conf to kern.exec_inject).
