@@ -42,6 +42,12 @@ cp $O/obj/stage0 $O/boot/sbin/launchd
 cp $H/rc.launchd $O/root/etc/rc
 cp ${RC_JOBS:-tvos/rc.jobs} $O/root/etc/rc.jobs
 cp work/tvos/var.skel $O/root/etc/var.skel
+# files of ours for the fresh /private/var (tvos/var/): owned by mobile under mobile/, else by root
+(cd tvos/var && find . -type f | sort) | while read -r f; do
+	f=${f#./}; mkdir -p $O/root/etc/var/$(dirname $f); cp tvos/var/$f $O/root/etc/var/$f
+	case $f in mobile/*) id=501;; *) id=0;; esac
+	printf 'f\t600\t%d\t%d\t/private/var/%s\t/etc/var/%s\n' $id $id "$f" "$f" >> $O/root/etc/var.skel
+done
 # our libraries inside tvOS programs (the kernel inserts them: init hands etc/inject.conf to kern.exec_inject).
 # Built against the iOS SDK, then marked tvOS (dyld refuses a library of another platform) and signed again.
 DYN="xnu-clang -arch arm64 -isysroot $THEOS/sdks/iPhoneOS16.5.sdk -O1"
