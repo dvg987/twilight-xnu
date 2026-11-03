@@ -1000,6 +1000,7 @@ fail(const char *why)
  * The same size as the box's screen, 32 bits a pixel.
  */
 #define FW_CFG_BASE     0x09020000ULL
+static int cmdline_ramfb_debug = 0;
 
 static void
 ramfb_setup(u64 at)
@@ -1018,9 +1019,11 @@ ramfb_setup(u64 at)
 		for (u32 k = 0; k < sizeof(file); k++) {
 			((u8 *)&file)[k] = *(volatile u8 *)FW_CFG_BASE;
 		}
+		if (cmdline_ramfb_debug) {
+			print("fw_cfg: %x %s (%d bytes)\n", (u64)__builtin_bswap16(file.select), file.name, (u64)__builtin_bswap32(file.size));
+		}
 		if (str_eq(file.name, "etc/ramfb")) {
 			select = __builtin_bswap16(file.select);
-			print("ramfb: fw_cfg file of %d bytes\n", (u64)__builtin_bswap32(file.size));
 		}
 	}
 	if (select == 0) {
@@ -1035,7 +1038,7 @@ ramfb_setup(u64 at)
 	cfg.height = __builtin_bswap32(1080);
 	cfg.stride = __builtin_bswap32(1920 * 4);
 	dma.control = __builtin_bswap32(select << 16 | 0x08 | 0x10);
-	dma.length = __builtin_bswap32(sizeof(cfg));
+	dma.length = __builtin_bswap32(28);    /* (sizeof is 32: the struct is aligned to 8) */
 	dma.address = __builtin_bswap64((u64)&cfg);
 	__asm__ volatile ("dsb sy" ::: "memory");
 	*(volatile u32 *)(FW_CFG_BASE + 16) = __builtin_bswap32((u32)((u64)&dma >> 32));
