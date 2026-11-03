@@ -74,6 +74,14 @@ for prog in bluetool; do
 	$LDID -S -Cadhoc $O/obj/$prog          # (ad hoc: what the kernel's AMFI stand-in takes for a platform binary)
 	cp $O/obj/$prog $O/root/bin/
 done
+# bluetoothd, one instruction changed: every pairing agent registers as one that answers pairing requests itself
+# (kCBMsgArgProgrammaticPairing), so a "Just Works" request goes to Settings' agent, which tvos/src/twlbt.c answers at
+# once, and not to an alert: the Xiaomi remote gives up on a pairing 3.4 s after asking for it. Signed again with its
+# own entitlements.
+python3 tools/patch-bluetoothd.py $ROOTFS/usr/sbin/bluetoothd $O/obj/bluetoothd
+$LDID -e $ROOTFS/usr/sbin/bluetoothd > $O/obj/bluetoothd.ents
+$LDID -S$O/obj/bluetoothd.ents -Cadhoc $O/obj/bluetoothd
+install -m 755 $O/obj/bluetoothd $O/root/bin/
 [ -n "$QUIET" ] && : > $O/root/etc/quiet
 # init's own file test reads this pattern back through read() and mmap()
 python3 -c "import sys; sys.stdout.buffer.write(bytes((i*31 + (i>>8)) & 0xff for i in range(300000)))" > $O/root/share/pattern.bin
@@ -97,6 +105,8 @@ def bluetool(job):
     job['ProgramArguments'] = ['/redwood/bin/bluetool']
     job.setdefault('MachServices', {})['com.apple.BlueTool'] = True
 def bluetoothd(job):
+    job.pop('Program', None)
+    job['ProgramArguments'] = ['/redwood/bin/bluetoothd']
     job.setdefault('EnvironmentVariables', {})['BT_HCI_TRANSPORT'] = 'H4BC:POSIX:com.apple.uart.bluetooth,3000000'
 edit('com.apple.BlueTool', bluetool)
 edit('com.apple.bluetoothd', bluetoothd)

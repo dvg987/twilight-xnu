@@ -1,9 +1,10 @@
 /*
  * libtwlbt.dylib: inside tvOS's Settings. A Bluetooth LE accessory that pairs "Just Works" (no display, no keys: the box's
- * own remote) has bluetoothd ask the app's pairing agent to confirm, and Settings is to put up an alert; here that alert
- * never comes up, the app waits for an answer, and the remote gives up a few seconds later (SMP status 719). So a
- * Just Works request is accepted at once, for the user; any other kind (a passkey, a number to compare) still goes to
- * Settings. Addresses are tvOS 16.5 (20L563) AppleTV6,2's, unslid; each is checked first.
+ * own remote) has bluetoothd ask for a confirmation, and the Xiaomi remote gives up 3.4 s after it asked to pair (SMP
+ * status 719), before anyone can answer an alert. Our bluetoothd (tools/patch-bluetoothd.py) hands the request to
+ * Settings' pairing agent instead, and here a Just Works request is accepted at once, for the user; any other kind (a
+ * passkey, a number to compare) still goes to Settings. Addresses are tvOS 16.5 (20L563) AppleTV6,2's, unslid; each is
+ * checked first.
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <dlfcn.h>
