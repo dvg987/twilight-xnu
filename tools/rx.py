@@ -3,7 +3,15 @@
 import socket, sys
 
 def rx(cmd, host='192.168.77.1', port=5002, out=None):
-    s = socket.create_connection((host, port), timeout=30)
+    import time
+    for attempt in range(50):        # the nc -e loop on the box needs a moment between connections
+        try:
+            s = socket.create_connection((host, port), timeout=30)
+            break
+        except ConnectionRefusedError:
+            if attempt == 49:
+                raise
+            time.sleep(0.2)
     s.sendall(('exec 2>&1; ' + cmd + '\n').encode())
     s.shutdown(socket.SHUT_WR)
     s.settimeout(600)
