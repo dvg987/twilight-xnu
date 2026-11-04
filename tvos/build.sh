@@ -46,6 +46,13 @@ cp work/tvos/var.skel $O/root/etc/var.skel
 (cd tvos/var && find . -type f | sort) | while read -r f; do
 	f=${f#./}; mkdir -p $O/root/etc/var/$(dirname $f); cp tvos/var/$f $O/root/etc/var/$f
 	case $f in mobile/*) id=501;; *) id=0;; esac
+	d=
+	for part in $(dirname "$f" | tr / ' '); do              # its directories first, where the skeleton has none yet
+		[ "$part" = . ] && continue
+		d=${d:+$d/}$part
+		awk -F'\t' -v p="/private/var/$d" '$5 == p { found = 1 } END { exit !found }' $O/root/etc/var.skel ||
+			printf 'd\t755\t%d\t%d\t/private/var/%s\n' $id $id "$d" >> $O/root/etc/var.skel
+	done
 	printf 'f\t600\t%d\t%d\t/private/var/%s\t/etc/var/%s\n' $id $id "$f" "$f" >> $O/root/etc/var.skel
 done
 # the W2's Wi-Fi firmware for the kernel (fw/ of the small image; tools/w2-fw.py makes it from CoreELEC's file)

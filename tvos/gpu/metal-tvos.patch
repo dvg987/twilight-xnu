@@ -1,0 +1,435 @@
+diff --git a/metal-plugin/NativeMaliMetalPlugin.mm b/metal-plugin/NativeMaliMetalPlugin.mm
+index ec81e63..c394264 100644
+--- a/metal-plugin/NativeMaliMetalPlugin.mm
++++ b/metal-plugin/NativeMaliMetalPlugin.mm
+@@ -6,6 +6,9 @@
+ // metal2vulkan runtime over the bridge) opened on PanVK, which the original registration (_MTLAddDevice) adds to the system's devices;
+ // QuartzCore then renders the UI through it. Every other process returns nil and keeps the original software renderer.
+ // Diagnostics reach the kernel's console through MaliService (MALI_LOG), the one console a sandboxed process can write.
++// tvOS 16.5 (twilight, NMM_TVOS): the bundle is in the root filesystem's /System/Library/Extensions (no GPU add-on), no iPadOS 17.7.11 address is
++// read or written, and a kernel without MALI_LOG / MALI_GOP / MALI_MAP_SCANOUT (kIOReturnUnsupported, or kIOReturnBadArgument for a selector
++// past its table) is tolerated: the log falls back to /dev/console or the system log, the display hand-off is not attempted again.
+ #import <Foundation/Foundation.h>
+ #import <Metal/Metal.h>
+ #include <dlfcn.h>
+@@ -31,6 +34,7 @@
+ #include <set>
+ #include <string>
+ #include <unordered_map>
++#include <os/log.h>
+ #include "NativeBridgeMetalFrontend.h"
+ #include "bridge/NativeMetalBridge.h"
+ #include "mali_uapi.h"
+@@ -67,7 +71,10 @@ IOKit &iokit() {
+     static bool ready;
+     if (!ready) {
+         ready = true;
+-        k.handle = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW | RTLD_LOCAL);
++        // tvOS 16.5's root filesystem has no IOKit.framework/IOKit link and the shared cache knows the framework only by its install name.
++        k.handle = dlopen("/System/Library/Frameworks/IOKit.framework/Versions/A/IOKit", RTLD_NOW | RTLD_LOCAL);
++        if (!k.handle)
++            k.handle = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW | RTLD_LOCAL);
+         if (k.handle) {
+             k.matching = (void *(*)(const char *))dlsym(k.handle, "IOServiceMatching");
+             k.getService = (GetServiceFn)dlsym(k.handle, "IOServiceGetMatchingService");
+@@ -98,7 +105,9 @@ void mlog(const char *format, ...) {
+                 connection = c;
+         }
+     }
+-    if (connection && k.call) {
++    static bool noKernelLog;   // the kernel has no MALI_LOG (or no service): the lines go to /dev/console, else the system log
++    static int console = -2;
++    {
+         mali_log_in line = {};
+         va_list ap;
+         va_start(ap, format);
+@@ -107,7 +116,24 @@ void mlog(const char *format, ...) {
+         const int prefix = server ? 0 : snprintf(line.text, sizeof line.text, "[%s] ", getprogname());
+         vsnprintf(line.text + prefix, sizeof line.text - prefix, format, ap);
+         va_end(ap);
+-        k.call(connection, MALI_LOG, &line, sizeof line, nullptr, nullptr);
++        int r = -1;
++        if (connection && k.call && !noKernelLog) {
++            r = k.call(connection, MALI_LOG, &line, sizeof line, nullptr, nullptr);
++            if (r == (int)0xe00002c7 /* kIOReturnUnsupported */ || r == (int)0xe00002c2 /* kIOReturnBadArgument */)
++                noKernelLog = true;
++        }
++        if (r != 0) {
++            if (console == -2)
++                console = open("/dev/console", O_WRONLY | O_NOCTTY | O_NONBLOCK | O_CLOEXEC);
++            if (console >= 0) {
++                char text[sizeof line.text + 16];
++                const int n = snprintf(text, sizeof text, "mali: user: %s\n", line.text);
++                if (n > 0)
++                    (void)!write(console, text, (size_t)std::min(n, (int)sizeof text - 1));
++            } else {
++                os_log(OS_LOG_DEFAULT, "mali: user: %{public}s", line.text);
++            }
++        }
+     }
+     pthread_mutex_unlock(&lock);
+ }
+@@ -154,6 +180,12 @@ void logFramebufferChoice(const char *when) {
+             CFRelease(deep);
+         }
+     }
++#if NMM_TVOS
++    // tvOS 16.5: the iPadOS 17.7.11 addresses and display-object offsets below mean nothing here; only the preference and MobileGestalt answers.
++    (void)start;
++    mlog("qc %s: pref bits %#x (1 set, 2 false, 4 MG deep, 8 MG answer), uid %d", when, prefs, getuid());
++    return;
++#endif
+     if (!start) {
+         mlog("qc %s: no CARenderServerStart, pref bits %#x (1 set, 2 false, 4 MG deep, 8 MG answer), uid %d", when, prefs, getuid());
+         return;
+@@ -188,6 +220,11 @@ void logFramebufferChoice(const char *when) {
+ // object has taken the byte's value by then: clear both in this process (what UniXNU's Adreno plugin did as an experiment), so the framebuffer
+ // formats it asks for next are the plain BGRA the display driver takes. Writes only when a flag is set.
+ void clearDeepFramebuffer() {
++#if NMM_TVOS
++    // tvOS 16.5: never written at iPadOS addresses. The deep (half-float 'RGhA') framebuffer is kept off by CAEnableDeepFramebuffer=false in the
++    // render server's preferences (the image's var skeleton) and by the same preference set in openDevice before QuartzCore asks.
++    return;
++#endif
+     void *start = dlsym(RTLD_DEFAULT, "CARenderServerStart");
+     if (!start)
+         return;
+@@ -1329,6 +1366,24 @@ void *memoryThread(void *) {
+ // of Settings (CoreUI's vector glyphs, through a Core Image context): without a Metal device Core Image falls back to OpenGL ES, which this
+ // device has none of, and it ends in CI::GLContext::init with a jump to 0 (xnu-probe/runs/t19; the kernel's sandbox grant lists it too).
+ bool clientProcess() {
++#if NMM_TVOS
++    // tvOS: the render server alone by default (no lock-screen posters, no Settings glyph agent of iPadOS); boot-arg mali-clients=a,b,c names
++    // more processes (iconservicesagent, PineBoard, HeadBoard, TVSettings ... once one of them is seen to want Metal).
++    char list[256] = {};
++    if (!bootArgValue("mali-clients", list, sizeof list))
++        return false;
++    const char *self = getprogname();
++    const size_t length = strlen(self);
++    for (const char *at = list; *at;) {
++        const size_t n = strcspn(at, ",");
++        if (n == length && strncmp(at, self, n) == 0)
++            return true;
++        at += n;
++        if (*at == ',')
++            ++at;
++    }
++    return false;
++#endif
+     // Which of the posters is the one on the lock screen depends on the Data volume (a fresh one picks the collections / photos posters, an older
+     // one the Aegir and Kaleidoscope ones), so every poster extension of the system gets a device; the idle ones never ask for it.
+     static const char *const names[] = {
+@@ -1372,6 +1427,8 @@ void *presenterThread(void *argument) {
+         r = k.call(connection, MALI_GOP, &in, sizeof in, &out, &outSize);
+         if (r == 0)
+             break;
++        if (r == (int)0xe00002c7 /* kIOReturnUnsupported */ || r == (int)0xe00002c2 /* kIOReturnBadArgument: no such selector */)
++            break;   // this kernel has no display hand-off at all: no point asking again
+         sleep(2);
+     }
+     if (r != 0) {
+@@ -1523,6 +1580,10 @@ id openDevice(unsigned port) {
+         setenv("METAL2VULKAN_LOG_PIPELINES", "1", 0);
+         CFPreferencesSetAppValue(CFSTR("CAEnableFramebufferCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
+         CFPreferencesSetAppValue(CFSTR("CAEnableIOSurfaceCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
++#if NMM_TVOS
++        // The display driver takes 4-byte single-plane layers only: no half-float deep framebuffer (tvOS answers 'RGhA' for it).
++        CFPreferencesSetAppValue(CFSTR("CAEnableDeepFramebuffer"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
++#endif
+ 
+         // The runtime refuses to open without a writable shader-cache directory, and which directories the render server's sandbox lets it write is
+         // not known from here: the user cache and temp directories, /tmp and /var/tmp, the first that opens a device.
+@@ -1686,9 +1747,9 @@ extern "C" __attribute__((visibility("default"))) int nmm_selftest(int quartzcor
+     mlog("selftest: %s, cache %s, QuartzCore library %zu bytes", icd, cache, library.size());
+     NmbSelftest result = {};
+     const uint32_t code = nmb_selftest(icd, cache, library.empty() ? nullptr : library.data(), library.size(), selftestMark, &result);
+-    mlog("selftest: result %#x stage %#x compute_bad %u render_bad %u import_bad %u qc functions %u kernels %u/%u pairs %u/%u", code, result.stage,
++    mlog("selftest: result %#x stage %#x compute_bad %u render_bad %u import_bad %u qc functions %u kernels %u/%u pairs %u/%u uber %s", code, result.stage,
+          result.compute_bad, result.render_bad, result.import_bad, result.qc_functions, result.qc_kernels_ok, result.qc_kernels_failed, result.qc_pairs_ok,
+-         result.qc_pairs_failed);
++         result.qc_pairs_failed, result.reserved == 1 ? "made" : result.reserved == 2 ? "refused" : "-");
+     mlog("selftest: %s", result.message);
+     return (int)code;
+ }
+diff --git a/metal-plugin/bridge/NativeMetalBridge.rs b/metal-plugin/bridge/NativeMetalBridge.rs
+index 997735f..407f6c0 100644
+--- a/metal-plugin/bridge/NativeMetalBridge.rs
++++ b/metal-plugin/bridge/NativeMetalBridge.rs
+@@ -302,9 +302,78 @@ fn quartzcore(run: &mut Run, device: &Device, bytes: &[u8]) -> Result<(), String
+             }
+         }
+     }
++    uber(run, device, &library, &names);
+     Ok(())
+ }
+ 
++/// QuartzCore's first pipeline on tvOS 16.5 (CA::OGL::MetalContext::create_fragment_shader for spec "A2Xhf": two attachments,
++/// half precision, framebuffer fetch, no images): fixed_vert_lph_spc with fixed_frag_lph_cph and the constants CA gives them,
++/// fc_color_opcodes0/1 as uchar3. `reserved` is 1 when the pipeline is made, 2 when it is refused (the reason in `message`).
++fn uber(run: &mut Run, device: &Device, library: &metal2vulkan_runtime::Library, names: &[String]) {
++    use metal2vulkan::library::{FunctionConstantValue, FunctionConstantValues};
++    use metal2vulkan::metal::{DataType, VertexFormat};
++    use metal2vulkan::pipeline::{VertexAttributeDescriptor, VertexBufferLayoutDescriptor, VertexDescriptor};
++    let (vname, fname) = ("fixed_vert_lph_spc", "fixed_frag_lph_cph");
++    if !names.iter().any(|n| n == vname) || !names.iter().any(|n| n == fname) {
++        return;
++    }
++    let mut values = FunctionConstantValues::defaults();
++    let mut set = |name: &str, ty: DataType, bytes: &[u8]| {
++        values.by_name.insert(name.to_string(), FunctionConstantValue::new(ty, bytes.to_vec()));
++    };
++    for (name, value) in [("fc_generic", 0), ("fc_framebuffer_fetch", 1), ("fc_framebuffer_sample", 0), ("fc_has_lod_bias", 0),
++                          ("fc_has_noise_scale", 0), ("fc_has_ycbcr_matrix", 0), ("fc_has_gamma_luts", 0), ("fc_has_asg_77_weights", 0),
++                          ("fc_has_noise_tex", 0), ("fc_has_color_params", 0), ("fc_has_lut_tex", 0), ("fc_has_attachment_0", 1),
++                          ("fc_has_attachment_1", 1), ("fc_has_attachment_2", 0), ("fc_clamp_color", 0), ("fc_extended_range", 0),
++                          ("fc_unbounded_range", 0), ("fc_debug_xr", 0), ("fc_has_premultiply", 0), ("fc_has_hdr_scale", 0),
++                          ("fc_has_edr_factor", 0), ("fc_base_color", 0)] {
++        set(name, DataType::Bool, &[value]);
++    }
++    for (name, value) in [("fc_vertex_layout", 0), ("fc_attachment_count", 2), ("fc_texture_function", 0), ("fc_blend_function", 54),
++                          ("fc_destination_function", 0), ("fc_image_count", 0), ("fc_dest_index", 0), ("fc_dest_count", 1),
++                          ("fc_noise_width", 0)] {
++        set(name, DataType::UChar, &[value]);
++    }
++    for i in 0..2 {
++        for name in ["fc_image_function", "fc_coord_function", "fc_plane_count", "fc_texcoord_count", "fc_memoryless_index", "fc_filter",
++                     "fc_color_inputs"] {
++            set(&format!("{name}{i}"), DataType::UChar, &[0]);
++        }
++        set(&format!("fc_color_opcodes{i}"), DataType::UChar3, &[0, 0, 0]);
++        for name in ["fc_color_opaque", "fc_has_color_trc", "fc_has_color_cube"] {
++            set(&format!("{name}{i}"), DataType::Bool, &[0]);
++        }
++        for plane in ["A", "B", "C"] {
++            set(&format!("fc_has_image_{i}{plane}"), DataType::Bool, &[0]);
++        }
++    }
++    let made = (|| -> Result<(), String> {
++        let vertex = library.new_function_with_name_constant_values(vname, &values).map_err(|e| format!("{vname}: {e:?}"))?;
++        let fragment = library.new_function_with_name_constant_values(fname, &values).map_err(|e| format!("{fname}: {e:?}"))?;
++        let mut inputs = VertexDescriptor::new();
++        for (index, format, offset) in [(0, VertexFormat::Float4, 0), (1, VertexFormat::Float2, 16), (2, VertexFormat::Float2, 24),
++                                        (3, VertexFormat::Half4, 32), (4, VertexFormat::Float, 40)] {
++            inputs.attributes.insert(index, VertexAttributeDescriptor::new(format, offset, 0));
++        }
++        inputs.layouts.insert(0, VertexBufferLayoutDescriptor::new(Some(48)));
++        let mut descriptor = RenderPipelineDescriptor::new(StageSource::Function(vertex.function_descriptor()));
++        descriptor.fragment = Some(StageSource::Function(fragment.function_descriptor()));
++        descriptor.vertex_descriptor = Some(inputs);
++        descriptor.color_attachments[0] = Some(ColorAttachmentDescriptor::new(PixelFormat::BGRA8Unorm));
++        descriptor.color_attachments[1] = Some(ColorAttachmentDescriptor::new(PixelFormat::BGRA8Unorm));
++        device.new_render_pipeline_state(&descriptor, &PipelineOptions::default()).map(|_| ()).map_err(|e| format!("uber pipeline: {e:?}"))
++    })();
++    match made {
++        Ok(()) => run.out.reserved = 1,
++        Err(why) => {
++            run.out.reserved = 2;
++            let n = why.len().min(run.out.message.len() - 1);
++            run.out.message[..n].copy_from_slice(&why.as_bytes()[..n]);
++            run.out.message[n] = 0;
++        }
++    }
++}
++
+ fn selftest(run: &mut Run, loader: &CStr, cache: &CStr, qc: &[u8]) -> u32 {
+     run.step(0x6501);
+     let device = match open(loader, cache) {
+diff --git a/metal-plugin/frontend/NativeBridgeMetalFrontend.mm b/metal-plugin/frontend/NativeBridgeMetalFrontend.mm
+index cde587a..f1bdf45 100644
+--- a/metal-plugin/frontend/NativeBridgeMetalFrontend.mm
++++ b/metal-plugin/frontend/NativeBridgeMetalFrontend.mm
+@@ -809,6 +809,7 @@ static void waitForResource(id resource);
+ @property(nonatomic,strong) id<MTLHeap> parentHeap;
+ @property(nonatomic) NSUInteger heapOffset;
+ @property(nonatomic) BOOL counted;   // its surface counted in use (countUse)
++@property(nonatomic) BOOL sharedHandle;   // a memoryless texture's image, shared (memorylessImage): never released by the texture
+ - (void)countUse;
+ @end
+ // The render server counts the surfaces it textures in use while the textures live (countUse).
+@@ -1023,8 +1024,31 @@ static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out)
+  }
+  return true;
+ }
++// Memoryless textures (MTLStorageModeMemoryless): on Apple's GPUs they live in tile memory and cost nothing, and CoreAnimation makes a
++// framebuffer-sized one for every frame. PanVK has no lazily allocated memory, so each would be a real image (8.6 MB at 1080p), and
++// they are not given back as fast as they come: the render server ran out of memory in seconds. A memoryless texture's texels never
++// outlive its render pass (it is neither loaded nor stored), so textures of one descriptor share a few images, handed out in turn: a
++// pass that binds two of the same descriptor still gets two different images.
++static bool isMemoryless(const NmbTextureDescriptor &d) {return ((d.options>>4)&0xf)==3;}
++static NmbTexture *memorylessImage(const NmbTextureDescriptor &d,bool *shared) {
++ struct Set {NmbTextureDescriptor d;NmbTexture *images[4];unsigned count,next;};
++ static std::mutex lock;static std::vector<Set> sets;
++ std::lock_guard<std::mutex> hold(lock);
++ Set *set=nullptr;
++ for(Set &s:sets)if(!memcmp(&s.d,&d,sizeof d)){set=&s;break;}
++ if(!set){sets.push_back(Set{d,{},0,0});set=&sets.back();}
++ if(set->count<4){
++  NmbTexture *made=nmb_texture_new(gDevice,&d);if(!made)return nullptr;
++  set->images[set->count++]=made;*shared=true;
++  NSLog(@"native-metal: memoryless %llux%llu fmt %llu usage %llx: shared image %u",(unsigned long long)d.width,(unsigned long long)d.height,
++        (unsigned long long)d.format,(unsigned long long)d.usage,set->count);
++  return made;
++ }
++ *shared=true;
++ return set->images[set->next++%4];
++}
+ @implementation NBTexture
+-- (void)dealloc {nmb_texture_release(_handle);if(_surface){if(_counted)IOSurfaceDecrementUseCount(_surface);CFRelease(_surface);}}
++- (void)dealloc {if(!_sharedHandle)nmb_texture_release(_handle);if(_surface){if(_counted)IOSurfaceDecrementUseCount(_surface);CFRelease(_surface);}}
+ - (void)countUse {if(_surface && !_counted && gCountsSurfaceUse){IOSurfaceIncrementUseCount(_surface);_counted=YES;}}
+ - (MTLTextureType)textureType {return (MTLTextureType)_descriptor.type;}
+ - (MTLPixelFormat)pixelFormat {return (MTLPixelFormat)(_pvrtc?_pvrtc:_descriptor.format);}
+@@ -1318,24 +1342,37 @@ static bool methodABI(id object,SEL selector,const char *encoding) {
+  Method method=class_getInstanceMethod(object_getClass(object),selector);
+  return method && !strcmp(method_getTypeEncoding(method),encoding);
+ }
+-// Bytes of a function constant of MTLDataType `type` (scalars and 2/4-wide vectors; 3-wide vectors are not qualified).
++// Bytes of a function constant of MTLDataType `type`: the packed size the translator checks (lanes times the scalar), so a 3-wide
++// vector is 3 lanes (Metal's own storage of a uchar3 holds 4 bytes; the 4th is padding). tvOS 16.5's QuartzCore gives its uber
++// shader fc_color_opcodes0/1 as uchar3 (51): refused here, fixed_frag_lph_cph had no specialization and backboardd aborted.
+ static uint64_t constantBytes(uint64_t type) {
+  switch(type) {
+   case 3:case 29:case 33:return 4;
+   case 4:case 30:case 34:return 8;
++  case 5:case 31:case 35:return 12;
+   case 6:case 32:case 36:return 16;
+   case 16:case 37:case 41:return 2;
+   case 17:case 38:case 42:return 4;
++  case 18:case 39:case 43:return 6;
+   case 19:case 40:case 44:return 8;
+   case 45:case 49:case 53:return 1;
+   case 46:case 50:case 54:return 2;
++  case 47:case 51:case 55:return 3;
+   case 48:case 52:case 56:return 4;
+   case 81:case 85:return 8;
+   case 82:case 86:return 16;
++  case 83:case 87:return 24;
+   case 84:case 88:return 32;
+   default:return 0;
+  }
+ }
++// A specialization refused before or by the translator: the reason goes to the console as well as to the caller, whose own log
++// (QuartzCore's "Metal failed to specialize ... function") puts the error text on a line of its own that the board log loses.
++static id specializationRefused(NSError **error,NSString *name,NSString *why) {
++ noteProblem([NSString stringWithFormat:@"native-metal: specialized function %@: %@",name,why]);
++ if(error)*error=nbError([@"specialized function: " stringByAppendingString:why]);
++ return nil;
++}
+ static std::string quartzCoreCallers();
+ // A Core Image kernel library (metallib file_type 1: ci_stdlib, ci_filters, ci_raw, ci_stdlib_h) lists its kernels as TYPE 5 entries over
+ // one shared module. Metal names none of them (functionNames is empty) yet answers newFunctionWithName: and
+@@ -1356,7 +1393,7 @@ static NBFunction *ciKernelFunction(NBLibrary *library,NSString *name);
+  if(NBFunction *kernel=ciKernelFunction(self,name)){if(error)*error=nil;return (id<MTLFunction>)kernel;}
+  if(!values)values=[MTLFunctionConstantValues new];
+  if(!name || !values || !methodABI(values,@selector(newIndexedConstantArray),"@16@0:8") || !methodABI(values,@selector(newNamedConstantArray),"@16@0:8")) {
+-  if(error)*error=nbError(@"unqualified function constant values");return nil;
++  return specializationRefused(error,name,[NSString stringWithFormat:@"unqualified function constant values (%s)",values?object_getClassName(values):"nil"]);
+  }
+  MTLFunctionConstantValues *snapshot=[values copy];
+  NSArray *indexed=[snapshot newIndexedConstantArray],*named=[snapshot newNamedConstantArray];
+@@ -1364,11 +1401,14 @@ static NBFunction *ciKernelFunction(NBLibrary *library,NSString *name);
+  for(unsigned group=0;group<2;group++)for(id value in (group?named:indexed)) {
+   if(!methodABI(value,@selector(dataType),"Q16@0:8") || !methodABI(value,@selector(data),"^v16@0:8") ||
+      !methodABI(value,group?@selector(name):@selector(index),group?"@16@0:8":"Q16@0:8")) {
+-   if(error)*error=nbError(@"unqualified constant value ABI");return nil;
++   return specializationRefused(error,name,[NSString stringWithFormat:@"unqualified constant value ABI (%s)",object_getClassName(value)]);
+   }
+   id<NBOriginalConstantValue> v=value;
+   const uint64_t bytes=constantBytes(v.dataType);
+-  if(!bytes || !v.data){if(error)*error=nbError([NSString stringWithFormat:@"constant type %lu is not qualified",(unsigned long)v.dataType]);return nil;}
++  if(!bytes || !v.data) {
++   return specializationRefused(error,name,[NSString stringWithFormat:@"constant %@ type %lu is not qualified",
++       group?v.name:[NSString stringWithFormat:@"#%lu",(unsigned long)v.index],(unsigned long)v.dataType]);
++  }
+   constants.push_back({v.dataType,group?0:v.index,group?v.name.UTF8String:nullptr,v.data,bytes});
+  }
+  std::string text;
+@@ -1387,10 +1427,7 @@ static NBFunction *ciKernelFunction(NBLibrary *library,NSString *name);
+       (unsigned long long)(nowUs()-functionBegan),handle?1:0);
+   journal(head+std::string(name.UTF8String?:"?")+" k="+text+(handle?std::string():" err="+std::string(lastError().UTF8String?:"?"))+" | "+quartzCoreCallers());
+  }
+- if(!handle){
+-  noteProblem([NSString stringWithFormat:@"specialized function %@: %@",name,lastError()]);
+-  if(error)*error=nbError([NSString stringWithFormat:@"specialized function: %@",lastError()]);return nil;
+- }
++ if(!handle)return specializationRefused(error,name,[NSString stringWithFormat:@"%@ | k=%s",lastError(),text.c_str()]);
+  NBFunction *function=[NBFunction new];function.handle=handle;function.name=name;function.functionType=(MTLFunctionType)nmb_function_type(handle);
+  function.constantsText=text;function.library=self;function.constantValues=snapshot;if(error)*error=nil;return (id<MTLFunction>)function;
+ }
+@@ -1405,7 +1442,7 @@ static NBFunction *ciKernelFunction(NBLibrary *library,NSString *name);
+  if(!d.name){if(error)*error=nbError(@"a function name is required");return nil;}
+  if(d.constantValues)return [self newFunctionWithName:d.name constantValues:d.constantValues error:error];
+  id<MTLFunction> function=[self newFunctionWithName:d.name];
+- if(!function){if(error)*error=nbError([NSString stringWithFormat:@"function %@: %@",d.name,lastError()]);return nil;}
++ if(!function)return specializationRefused(error,d.name,[NSString stringWithFormat:@"function: %@",lastError()]);
+  if(error)*error=nil;return function;
+ }
+ - (NSArray<NSString *> *)functionNames {
+@@ -2998,6 +3035,13 @@ extern "C" void NBWaitInFlight(uint64_t beforeUs) {
+  for(NBCommandBuffer *commandBuffer in pending)
+   if(commandBuffer.committed && !commandBuffer.failedLocally && commandBuffer.committedUs<=beforeUs)nmb_command_buffer_wait(commandBuffer.handle,0);
+ }
++// For a processor copy of a surface the GPU draws (tvOS's twlhook: CoreAnimation's copy-back and its copy to the scanout, which an M2
++// scaler would do after the GPU on a real Apple TV): every command buffer committed before `beforeUs` (CLOCK_UPTIME_RAW) is done.
++extern "C" __attribute__((visibility("default"))) void native_bridge_metal_wait_committed(uint64_t beforeUs) {
++ NSArray *pending;@synchronized(gInFlight){pending=gInFlight.allObjects;}
++ for(NBCommandBuffer *commandBuffer in pending)
++  if(commandBuffer.committed && !commandBuffer.failedLocally && commandBuffer.committedUs<=beforeUs)nmb_command_buffer_wait(commandBuffer.handle,0);
++}
+ static void scheduled(void *context) {[(__bridge NBCommandBuffer *)context didSchedule];}
+ // The runtime's completion: the command buffer's own reference, taken at commit, is given back here.
+ static void completed(void *context) {
+@@ -3101,6 +3145,10 @@ static std::string quartzCoreCallers() {
+   header=(uintptr_t)info.dli_fbase;
+   snprintf(item,sizeof item," %lx",(unsigned long)((uintptr_t)frames[i]-header));out+=item;++kept;
+  }
++ #if NMM_TVOS
++ // tvOS 16.5: the offsets below are iPadOS 17.7.11's (21H461 QuartzCore); none of them is read here.
++ header=0;
++ #endif
+  // The context's own flags (int-154: the draws never took the generic path, which only bit 18 of MetalContext +0x1a0 or the debug byte
+  // can cause, and the debug byte was 0). MetalContext::create_pipeline_state (header +0x143000) saves its caller's x19 at fp-8, and its
+  // caller MetalContext::draw keeps `this` in x19: the frame record whose return address is +0x143214 links to that frame. Read with
+@@ -3878,14 +3926,16 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
+ }
+ - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d {
+  NmbTextureDescriptor descriptor;if(!textureDescriptor(d,&descriptor))return nil;
+- NmbTexture *handle=nmb_texture_new(gDevice,&descriptor);noteFormat((uint32_t)descriptor.format,handle!=nullptr);
++ bool shared=false;
++ NmbTexture *handle=isMemoryless(descriptor)?memorylessImage(descriptor,&shared):nmb_texture_new(gDevice,&descriptor);
++ noteFormat((uint32_t)descriptor.format,handle!=nullptr);
+  if(gLogTextures && textureLogTurn())
+   NSLog(@"native-metal: texture-log %llu texture %llux%llu fmt %llu type %llu levels %llu usage %llx options %llx %s",
+         (unsigned long long)gTexturesLogged.load(),(unsigned long long)descriptor.width,(unsigned long long)descriptor.height,
+         (unsigned long long)descriptor.format,(unsigned long long)descriptor.type,(unsigned long long)descriptor.levels,
+         (unsigned long long)descriptor.usage,(unsigned long long)descriptor.options,handle?"made":"REFUSED");
+  if(!handle){NBLOG(@"native-metal: texture (fmt %lu %lux%lu, %lu levels) refused: %@",(unsigned long)d.pixelFormat,(unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.mipmapLevelCount,lastError());return nil;}
+- NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
++ NBTexture *texture=[NBTexture new];texture.handle=handle;texture.sharedHandle=shared;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
+  if(isPvrtc(d.pixelFormat))texture.pvrtc=(uint32_t)d.pixelFormat;
+  return (id<MTLTexture>)texture;
+ }
+@@ -4254,7 +4304,9 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
+ #if defined(__arm64e__)
+  if(!base){NBLOG(@"native-metal: no _MTLDevice");return nil;}
+ #else
+- if(!base || class_getInstanceSize(base)!=536){NBLOG(@"native-metal: unexpected _MTLDevice ABI");return nil;}
++ // tvOS 16.5 (20L563): 528 bytes (_limits at 8, _commandBufferErrorOptions at 520), the same base methods.
++ if(!base || (class_getInstanceSize(base)!=536 && class_getInstanceSize(base)!=528)){
++  NBLOG(@"native-metal: unexpected _MTLDevice ABI (%zu bytes)",base?class_getInstanceSize(base):(size_t)0);return nil;}
+ #endif
+ #endif
+  if(!base)base=[NSObject class];
+diff --git a/metal-plugin/frontend/bridge/NativeMetalBridge.h b/metal-plugin/frontend/bridge/NativeMetalBridge.h
+index 7d6bbf0..29936bb 100644
+--- a/metal-plugin/frontend/bridge/NativeMetalBridge.h
++++ b/metal-plugin/frontend/bridge/NativeMetalBridge.h
+@@ -15,7 +15,7 @@ struct NmbSelftest {
+     uint32_t qc_functions;
+     uint32_t qc_kernels_ok, qc_kernels_failed;
+     uint32_t qc_pairs_ok, qc_pairs_failed;
+-    uint32_t reserved;
++    uint32_t reserved;           /* QuartzCore's uber pipeline (fixed_vert_lph_spc + fixed_frag_lph_cph, spec A2Xhf): 0 not tried, 1 made, 2 refused (why in message) */
+     char message[96];
+ };
+ /* Markers: 0x6501 device, 0x6502 fixture library, 0x6503 compute, 0x6504 render, 0x6505 import, 0x6506 QuartzCore, 0x650f done. */

@@ -3,12 +3,14 @@
  * Virtual table entries of CA::WindowServer's display and server classes are replaced by loggers that
  * call the originals. Addresses are tvOS 16.5 (20L563) AppleTV6,2's, unslid; each is checked first.
  */
+#include <dlfcn.h>
 #include <mach/mach.h>
 #include <mach-o/dyld.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 extern intptr_t _dyld_get_image_slide(const struct mach_header *mh);
@@ -188,6 +190,26 @@ static unsigned copies;
 extern IOSurfaceRef IOSurfaceLookup(uint32_t);
 extern void CFRelease(const void *);
 
+/*
+ * With the GPU drawing (the Mali's Metal plug-in), the frame just handed over may still be in flight: the copy waits for the work
+ * committed until now (the plug-in's native_bridge_metal_wait_committed; absent, as with the software renderer, nothing to wait for).
+ */
+static void
+wait_for_gpu(void)
+{
+	static void (*wait)(uint64_t);
+	static int looked;
+
+	if (!looked) {
+		looked = 1;
+		wait = (void (*)(uint64_t))dlsym(RTLD_DEFAULT, "native_bridge_metal_wait_committed");
+		say("twl: GPU frames: %s\n", wait ? "the copies wait for the Metal plug-in's work" : "no Metal plug-in, nothing to wait for");
+	}
+	if (wait != NULL) {
+		wait(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000);
+	}
+}
+
 static void
 copy_refs(IOSurfaceRef src, IOSurfaceRef dst)
 {
@@ -196,6 +218,7 @@ copy_refs(IOSurfaceRef src, IOSurfaceRef dst)
 	if (IOSurfaceGetWidth(src) != IOSurfaceGetWidth(dst) || IOSurfaceGetHeight(src) != IOSurfaceGetHeight(dst)) {
 		return;
 	}
+	wait_for_gpu();
 	IOSurfaceLock(src, 1 /* read only */, NULL);
 	IOSurfaceLock(dst, 0, NULL);
 	rows = IOSurfaceGetHeight(src);
