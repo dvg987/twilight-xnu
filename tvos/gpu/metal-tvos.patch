@@ -235,7 +235,7 @@ index 997735f..407f6c0 100644
      run.step(0x6501);
      let device = match open(loader, cache) {
 diff --git a/metal-plugin/frontend/NativeBridgeMetalFrontend.mm b/metal-plugin/frontend/NativeBridgeMetalFrontend.mm
-index cde587a..be2d7d5 100644
+index cde587a..2c56e3d 100644
 --- a/metal-plugin/frontend/NativeBridgeMetalFrontend.mm
 +++ b/metal-plugin/frontend/NativeBridgeMetalFrontend.mm
 @@ -796,6 +796,7 @@ static void waitForResource(id resource);
@@ -395,7 +395,25 @@ index cde587a..be2d7d5 100644
   if(error)*error=nil;return function;
  }
  - (NSArray<NSString *> *)functionNames {
-@@ -2998,6 +3038,13 @@ extern "C" void NBWaitInFlight(uint64_t beforeUs) {
+@@ -2791,6 +2831,17 @@ static char kUserDictionaryKey;
+    uint64_t seen=gBiggestPass.load();while(pixels>seen && !gBiggestPass.compare_exchange_weak(seen,pixels)){}
+    if(pixels>=2000000)gFullScreenPasses++;
+   }
++  // (tvOS) a command buffer of many passes: what its 33rd and 34th are, for the first few such command buffers
++  static std::atomic<unsigned> manyShown;
++  if((_dumpPasses==33 || _dumpPasses==34) && manyShown.load()<12) {
++   manyShown++;
++   MTLRenderPassColorAttachmentDescriptor *c=d.colorAttachments[0];
++   NSLog(@"native-metal: many passes: command buffer '%@' pass %u: c0 %p f%lu %lux%lu level %lu slice %lu %@ load %lu store %lu, c1 %p, depth %p, target %lux%lu",
++         self.label,_dumpPasses,(__bridge void *)c.texture,(unsigned long)c.texture.pixelFormat,(unsigned long)c.texture.width,(unsigned long)c.texture.height,
++         (unsigned long)c.level,(unsigned long)c.slice,c.texture.storageMode==MTLStorageModeMemoryless?@"memoryless":c.texture.storageMode==MTLStorageModePrivate?@"private":@"shared",
++         (unsigned long)c.loadAction,(unsigned long)c.storeAction,(__bridge void *)d.colorAttachments[1].texture,(__bridge void *)d.depthAttachment.texture,
++         (unsigned long)d.renderTargetWidth,(unsigned long)d.renderTargetHeight);
++  }
+  }
+  auto attachment=[&](MTLRenderPassAttachmentDescriptor *a,NmbPassAttachment &out)->bool {
+   if(!a.texture)return true;
+@@ -2998,6 +3049,13 @@ extern "C" void NBWaitInFlight(uint64_t beforeUs) {
   for(NBCommandBuffer *commandBuffer in pending)
    if(commandBuffer.committed && !commandBuffer.failedLocally && commandBuffer.committedUs<=beforeUs)nmb_command_buffer_wait(commandBuffer.handle,0);
  }
@@ -409,7 +427,7 @@ index cde587a..be2d7d5 100644
  static void scheduled(void *context) {[(__bridge NBCommandBuffer *)context didSchedule];}
  // The runtime's completion: the command buffer's own reference, taken at commit, is given back here.
  static void completed(void *context) {
-@@ -3101,6 +3148,10 @@ static std::string quartzCoreCallers() {
+@@ -3101,6 +3159,10 @@ static std::string quartzCoreCallers() {
    header=(uintptr_t)info.dli_fbase;
    snprintf(item,sizeof item," %lx",(unsigned long)((uintptr_t)frames[i]-header));out+=item;++kept;
   }
@@ -420,7 +438,7 @@ index cde587a..be2d7d5 100644
   // The context's own flags (int-154: the draws never took the generic path, which only bit 18 of MetalContext +0x1a0 or the debug byte
   // can cause, and the debug byte was 0). MetalContext::create_pipeline_state (header +0x143000) saves its caller's x19 at fp-8, and its
   // caller MetalContext::draw keeps `this` in x19: the frame record whose return address is +0x143214 links to that frame. Read with
-@@ -3878,14 +3929,16 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
+@@ -3878,14 +3940,16 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  }
  - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d {
   NmbTextureDescriptor descriptor;if(!textureDescriptor(d,&descriptor))return nil;
@@ -439,7 +457,7 @@ index cde587a..be2d7d5 100644
   if(isPvrtc(d.pixelFormat))texture.pvrtc=(uint32_t)d.pixelFormat;
   return (id<MTLTexture>)texture;
  }
-@@ -4254,7 +4307,9 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
+@@ -4254,7 +4318,9 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
  #if defined(__arm64e__)
   if(!base){NBLOG(@"native-metal: no _MTLDevice");return nil;}
  #else
