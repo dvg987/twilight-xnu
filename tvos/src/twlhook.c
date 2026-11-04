@@ -339,7 +339,67 @@ my_make_buffer_current(void *context, void *surface)
 
 #include <stdlib.h>
 #include <stdbool.h>
+#include <signal.h>
+#include <sys/ucontext.h>
 #include "twlinput.inc"
+
+/*
+ * A crash of the window server, said before it happens: the faulting address, the registers that matter and the
+ * frame-pointer chain, each as an image and an offset in it (dladdr), on the console; then the signal goes on as before.
+ */
+static void
+where(const char *what, uintptr_t pc)
+{
+	Dl_info info;
+
+	if (pc != 0 && dladdr((const void *)pc, &info) != 0 && info.dli_fname != NULL) {
+		const char *name = strrchr(info.dli_fname, '/');
+
+		say("twl: crash:   %s %#lx = %s+%#lx (%s)\n", what, (unsigned long)pc, name ? name + 1 : info.dli_fname,
+		    (unsigned long)(pc - (uintptr_t)info.dli_fbase), info.dli_sname ? info.dli_sname : "?");
+	} else {
+		say("twl: crash:   %s %#lx\n", what, (unsigned long)pc);
+	}
+}
+
+static void
+crashed(int sig, siginfo_t *info, void *context)
+{
+	ucontext_t *uc = (ucontext_t *)context;
+	uintptr_t fp;
+
+	say("twl: crash: signal %d, code %d, address %p\n", sig, info->si_code, info->si_addr);
+	if (uc != NULL && uc->uc_mcontext != NULL) {
+		where("pc", (uintptr_t)uc->uc_mcontext->__ss.__pc);
+		where("lr", (uintptr_t)uc->uc_mcontext->__ss.__lr);
+		fp = (uintptr_t)uc->uc_mcontext->__ss.__fp;
+		for (int i = 0; i < 24 && fp != 0 && (fp & 7) == 0; i++) {
+			uintptr_t next = ((uintptr_t *)fp)[0], ret = ((uintptr_t *)fp)[1];
+
+			where("frame", ret & 0x0000ffffffffffffUL);
+			if (next <= fp) {
+				break;
+			}
+			fp = next;
+		}
+	}
+	signal(sig, SIG_DFL);
+	raise(sig);
+}
+
+static void
+catch_crashes(void)
+{
+	struct sigaction sa;
+
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_sigaction = crashed;
+	sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+	sigaction(SIGSEGV, &sa, NULL);
+	sigaction(SIGBUS, &sa, NULL);
+	sigaction(SIGILL, &sa, NULL);
+	sigaction(SIGABRT, &sa, NULL);
+}
 
 __attribute__((constructor)) static void
 twl_init(void)
@@ -352,6 +412,7 @@ twl_init(void)
 	if (_NSGetExecutablePath(path, &size) != 0 || strstr(path, "backboardd") == NULL) {
 		return;
 	}
+	catch_crashes();
 	base = (uintptr_t)_dyld_get_shared_cache_range(&length);
 	slide = base - 0x180000000UL;
 	say("twl: in %s, shared cache slide %#lx\n", path, slide);

@@ -235,10 +235,18 @@ index 997735f..407f6c0 100644
      run.step(0x6501);
      let device = match open(loader, cache) {
 diff --git a/metal-plugin/frontend/NativeBridgeMetalFrontend.mm b/metal-plugin/frontend/NativeBridgeMetalFrontend.mm
-index cde587a..f1bdf45 100644
+index cde587a..be2d7d5 100644
 --- a/metal-plugin/frontend/NativeBridgeMetalFrontend.mm
 +++ b/metal-plugin/frontend/NativeBridgeMetalFrontend.mm
-@@ -809,6 +809,7 @@ static void waitForResource(id resource);
+@@ -796,6 +796,7 @@ static void waitForResource(id resource);
+ @property(nonatomic) void *wrapped;
+ @property(nonatomic,strong) id<MTLHeap> parentHeap;   // the heap that made the buffer, nil otherwise
+ @property(nonatomic) NSUInteger heapOffset;
++@property(nonatomic) IOSurfaceRef importedSurface;   // an IOSurface import: the surface object the import retains (as long as it lives)
+ @end
+ @interface NBTexture : NBObject
+ @property(nonatomic) NmbTexture *handle;
+@@ -809,6 +810,7 @@ static void waitForResource(id resource);
  @property(nonatomic,strong) id<MTLHeap> parentHeap;
  @property(nonatomic) NSUInteger heapOffset;
  @property(nonatomic) BOOL counted;   // its surface counted in use (countUse)
@@ -246,7 +254,29 @@ index cde587a..f1bdf45 100644
  - (void)countUse;
  @end
  // The render server counts the surfaces it textures in use while the textures live (countUse).
-@@ -1023,8 +1024,31 @@ static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out)
+@@ -886,9 +888,11 @@ static void watchImportPressure() {
+   dispatch_activate(source);
+  });
+ }
++// The surface held beside the buffer is the object the import itself retained, never the caller's: CoreAnimation hands in a new
++// IOSurfaceRef for a surface it has already imported, which is gone soon after, and a pruning would then read a freed object.
+ static void holdImport(uint64_t identity,uint64_t address,uint64_t bytes,NBBuffer *buffer,IOSurfaceRef surface,std::vector<NBBuffer *> &gone) {
+  pruneHeldImports(false,gone);
+- gHeldImports[{identity,address,bytes}]={buffer,surface};
++ gHeldImports[{identity,address,bytes}]={buffer,buffer.importedSurface?buffer.importedSurface:surface};
+ }
+ static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
+  struct Key {uint64_t identity,address,bytes;};
+@@ -903,7 +907,7 @@ static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
+  // The surface keeps its CPU mapping (the imported pages) until the import is freed.
+  NmbBuffer *handle=nmb_buffer_new_no_copy_releasing(gDevice,base,bytes,MTLResourceStorageModeShared,releaseSurface,(void *)CFRetain(surface));
+  if(!handle){CFRelease(surface);NBLOG(@"native-metal: surface import refused: %@",lastError());return nil;}
+- gSurfaceImportsMade++;buffer=[NBBuffer new];buffer.handle=handle;buffer.options=MTLResourceStorageModeShared;
++ gSurfaceImportsMade++;buffer=[NBBuffer new];buffer.handle=handle;buffer.options=MTLResourceStorageModeShared;buffer.importedSurface=surface;
+  if(key) {
+   // Associations whose import is gone are pruned whenever the table has doubled since the last pruning; a live one is never evicted.
+   if(gSurfaceImports.count>=gSurfaceImportsPruned) {
+@@ -1023,8 +1027,31 @@ static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out)
   }
   return true;
  }
@@ -279,7 +309,7 @@ index cde587a..f1bdf45 100644
  - (void)countUse {if(_surface && !_counted && gCountsSurfaceUse){IOSurfaceIncrementUseCount(_surface);_counted=YES;}}
  - (MTLTextureType)textureType {return (MTLTextureType)_descriptor.type;}
  - (MTLPixelFormat)pixelFormat {return (MTLPixelFormat)(_pvrtc?_pvrtc:_descriptor.format);}
-@@ -1318,24 +1342,37 @@ static bool methodABI(id object,SEL selector,const char *encoding) {
+@@ -1318,24 +1345,37 @@ static bool methodABI(id object,SEL selector,const char *encoding) {
   Method method=class_getInstanceMethod(object_getClass(object),selector);
   return method && !strcmp(method_getTypeEncoding(method),encoding);
  }
@@ -318,7 +348,7 @@ index cde587a..f1bdf45 100644
  static std::string quartzCoreCallers();
  // A Core Image kernel library (metallib file_type 1: ci_stdlib, ci_filters, ci_raw, ci_stdlib_h) lists its kernels as TYPE 5 entries over
  // one shared module. Metal names none of them (functionNames is empty) yet answers newFunctionWithName: and
-@@ -1356,7 +1393,7 @@ static NBFunction *ciKernelFunction(NBLibrary *library,NSString *name);
+@@ -1356,7 +1396,7 @@ static NBFunction *ciKernelFunction(NBLibrary *library,NSString *name);
   if(NBFunction *kernel=ciKernelFunction(self,name)){if(error)*error=nil;return (id<MTLFunction>)kernel;}
   if(!values)values=[MTLFunctionConstantValues new];
   if(!name || !values || !methodABI(values,@selector(newIndexedConstantArray),"@16@0:8") || !methodABI(values,@selector(newNamedConstantArray),"@16@0:8")) {
@@ -327,7 +357,7 @@ index cde587a..f1bdf45 100644
   }
   MTLFunctionConstantValues *snapshot=[values copy];
   NSArray *indexed=[snapshot newIndexedConstantArray],*named=[snapshot newNamedConstantArray];
-@@ -1364,11 +1401,14 @@ static NBFunction *ciKernelFunction(NBLibrary *library,NSString *name);
+@@ -1364,11 +1404,14 @@ static NBFunction *ciKernelFunction(NBLibrary *library,NSString *name);
   for(unsigned group=0;group<2;group++)for(id value in (group?named:indexed)) {
    if(!methodABI(value,@selector(dataType),"Q16@0:8") || !methodABI(value,@selector(data),"^v16@0:8") ||
       !methodABI(value,group?@selector(name):@selector(index),group?"@16@0:8":"Q16@0:8")) {
@@ -344,7 +374,7 @@ index cde587a..f1bdf45 100644
    constants.push_back({v.dataType,group?0:v.index,group?v.name.UTF8String:nullptr,v.data,bytes});
   }
   std::string text;
-@@ -1387,10 +1427,7 @@ static NBFunction *ciKernelFunction(NBLibrary *library,NSString *name);
+@@ -1387,10 +1430,7 @@ static NBFunction *ciKernelFunction(NBLibrary *library,NSString *name);
        (unsigned long long)(nowUs()-functionBegan),handle?1:0);
    journal(head+std::string(name.UTF8String?:"?")+" k="+text+(handle?std::string():" err="+std::string(lastError().UTF8String?:"?"))+" | "+quartzCoreCallers());
   }
@@ -356,7 +386,7 @@ index cde587a..f1bdf45 100644
   NBFunction *function=[NBFunction new];function.handle=handle;function.name=name;function.functionType=(MTLFunctionType)nmb_function_type(handle);
   function.constantsText=text;function.library=self;function.constantValues=snapshot;if(error)*error=nil;return (id<MTLFunction>)function;
  }
-@@ -1405,7 +1442,7 @@ static NBFunction *ciKernelFunction(NBLibrary *library,NSString *name);
+@@ -1405,7 +1445,7 @@ static NBFunction *ciKernelFunction(NBLibrary *library,NSString *name);
   if(!d.name){if(error)*error=nbError(@"a function name is required");return nil;}
   if(d.constantValues)return [self newFunctionWithName:d.name constantValues:d.constantValues error:error];
   id<MTLFunction> function=[self newFunctionWithName:d.name];
@@ -365,7 +395,7 @@ index cde587a..f1bdf45 100644
   if(error)*error=nil;return function;
  }
  - (NSArray<NSString *> *)functionNames {
-@@ -2998,6 +3035,13 @@ extern "C" void NBWaitInFlight(uint64_t beforeUs) {
+@@ -2998,6 +3038,13 @@ extern "C" void NBWaitInFlight(uint64_t beforeUs) {
   for(NBCommandBuffer *commandBuffer in pending)
    if(commandBuffer.committed && !commandBuffer.failedLocally && commandBuffer.committedUs<=beforeUs)nmb_command_buffer_wait(commandBuffer.handle,0);
  }
@@ -379,7 +409,7 @@ index cde587a..f1bdf45 100644
  static void scheduled(void *context) {[(__bridge NBCommandBuffer *)context didSchedule];}
  // The runtime's completion: the command buffer's own reference, taken at commit, is given back here.
  static void completed(void *context) {
-@@ -3101,6 +3145,10 @@ static std::string quartzCoreCallers() {
+@@ -3101,6 +3148,10 @@ static std::string quartzCoreCallers() {
    header=(uintptr_t)info.dli_fbase;
    snprintf(item,sizeof item," %lx",(unsigned long)((uintptr_t)frames[i]-header));out+=item;++kept;
   }
@@ -390,7 +420,7 @@ index cde587a..f1bdf45 100644
   // The context's own flags (int-154: the draws never took the generic path, which only bit 18 of MetalContext +0x1a0 or the debug byte
   // can cause, and the debug byte was 0). MetalContext::create_pipeline_state (header +0x143000) saves its caller's x19 at fp-8, and its
   // caller MetalContext::draw keeps `this` in x19: the frame record whose return address is +0x143214 links to that frame. Read with
-@@ -3878,14 +3926,16 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
+@@ -3878,14 +3929,16 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  }
  - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d {
   NmbTextureDescriptor descriptor;if(!textureDescriptor(d,&descriptor))return nil;
@@ -409,7 +439,7 @@ index cde587a..f1bdf45 100644
   if(isPvrtc(d.pixelFormat))texture.pvrtc=(uint32_t)d.pixelFormat;
   return (id<MTLTexture>)texture;
  }
-@@ -4254,7 +4304,9 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
+@@ -4254,7 +4307,9 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
  #if defined(__arm64e__)
   if(!base){NBLOG(@"native-metal: no _MTLDevice");return nil;}
  #else
