@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.twilight.sshd</string>
+	<!-- OpenSSH of the prefix on the data volume (/var/jb: tools/twl-jb.sh), as root with the key build.sh put in
+	     /var/root/.ssh (SSH=1), on every interface, port 22. The host key is made on the computer (work/ssh), so it
+	     is the same for every image and every data volume. No PAM (no pam.d for sshd in the prefix), no passwords. The login shell is root's in /var/jb/etc/master.passwd (zsh of the prefix). -->
+	<key>ProgramArguments</key>
+	<array>
+		<string>/var/jb/usr/sbin/sshd</string>
+		<string>-D</string>
+		<string>-e</string>
+		<string>-h</string>
+		<string>/var/root/.ssh/ssh_host_ed25519_key</string>
+		<string>-o</string>
+		<string>UsePAM=no</string>
+		<string>-o</string>
+		<string>PasswordAuthentication=no</string>
+		<string>-o</string>
+		<string>KbdInteractiveAuthentication=no</string>
+		<string>-o</string>
+		<string>PermitRootLogin=prohibit-password</string>
+		<string>-o</string>
+		<string>AuthorizedKeysFile=/var/root/.ssh/authorized_keys</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/var/jb/usr/bin:/var/jb/bin:/var/jb/usr/sbin:/var/jb/sbin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+	</dict>
+	<!-- kept running while there is a prefix: none yet, no attempts -->
+	<key>KeepAlive</key>
+	<dict>
+		<key>PathState</key>
+		<dict>
+			<key>/var/jb/usr/sbin/sshd</key>
+			<true/>
+		</dict>
+	</dict>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<key>StandardOutPath</key>
+	<string>/dev/console</string>
+	<key>StandardErrorPath</key>
+	<string>/dev/console</string>
+</dict>
+</plist>

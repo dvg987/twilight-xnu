@@ -8,12 +8,21 @@
 #
 # env: JOBS="labels"  the tvOS jobs started at boot (default below); REST=1 the others on demand
 #      ARGS="..."     more boot-args;  OSLOG="labels" jobs whose os_log goes to the console
+#      VAR=1          /private/var kept on the eMMC: emmc=2 var_hfs=emmc_darwin_data (the data volume, darwin from
+#                     4 GiB on: tools/twl-datavol.py, written once from the rescue Linux by tools/twl-datavol-write.py)
+#      JB=1           the package manager's prefix (tools/twl-jb.sh: work/twl-jb) in the image as /redwood/jb, for
+#                     init to copy to /var/jb on the data volume when it has none or another version (needs VAR=1;
+#                     ~43 MB more image, so leave it out once the prefix is there)
+#      SSH=1          sshd of the prefix as a launchd job (root, the key in work/ssh/authorized_keys, by default
+#                     ~/.ssh/id_ed25519.pub; host key work/ssh/ssh_host_ed25519_key, made once), configd and
+#                     mDNSResponder for DHCP and names, en0's address on the console (net_test), /bin/sh and friends
+#                     from the prefix (a union over the tvOS volume's /bin), uicache for the prefix's applications
 set -e
 cd "$(dirname "$0")/.."
 TOP=$PWD
 H=hakios/userland
 ROOTFS=work/tvos/rootfs
-O=out/tvos
+O=${OUT:-out/tvos}                     # OUT, PAYLOAD: build somewhere else than out/tvos, out/payload-tvos.bin
 source hakios/xnu-env.sh
 CC="xnu-clang -arch arm64 -Os -static -nostdlib -ffreestanding -fno-stack-protector -fno-builtin -Wall -Wextra"
 LD="-Wl,-e,_start -Wl,-pagezero_size,0x100000000"
@@ -21,6 +30,10 @@ JOBS=${JOBS-"com.apple.notifyd com.apple.cfprefsd.xpc.daemon com.apple.logd com.
 	com.apple.distnoted.xpc.daemon com.apple.diagnosticd com.apple.fseventsd com.apple.containermanagerd
 	com.apple.runningboardd com.apple.backboardd com.apple.mobile.usermanagerd com.apple.mobilegestalt.xpc
 	com.apple.lsd com.apple.powerd com.apple.pluginkit.pkd com.apple.Pineboard com.apple.wifid"}
+[ -n "$SSH" ] && JOBS="$JOBS com.apple.configd com.apple.mDNSResponder"   # DHCP on en0 (IPConfiguration), DNS
+EMMC="emmc=1"
+[ -n "$VAR" ] && EMMC="emmc=2 var_hfs=emmc_darwin_data"
+[ -n "$JB" ] && [ ! -f work/twl-jb/root/var/jb/.jb-version ] && { echo "build.sh: JB=1: run tools/twl-jb.sh first" >&2; exit 1; }
 
 rm -rf $O/root $O/boot
 mkdir -p $O/obj $O/root/{sbin,bin,etc,lib,share,LaunchDaemons,empty,xpc,hal,dev,private/var} \
@@ -55,6 +68,29 @@ cp work/tvos/var.skel $O/root/etc/var.skel
 	done
 	printf 'f\t600\t%d\t%d\t/private/var/%s\t/etc/var/%s\n' $id $id "$f" "$f" >> $O/root/etc/var.skel
 done
+# SSH=1: root's key and the host key in /private/var/root/.ssh (from work/ssh, never in the repository; on a kept
+# data volume only when not there yet), the jobs, and the prefix's shells as /bin/sh, /bin/bash, /bin/zsh -- the
+# boot volume's jb-bin, which init puts over the tvOS volume's /bin as a union (tvOS has no /bin/sh)
+if [ -n "$SSH" ]; then
+	mkdir -p work/ssh $O/root/etc/var/root/.ssh $O/boot/jb-bin
+	[ -f work/ssh/authorized_keys ] || cp "${SSH_KEY:-$HOME/.ssh/id_ed25519.pub}" work/ssh/authorized_keys
+	[ -f work/ssh/ssh_host_ed25519_key ] || ssh-keygen -q -t ed25519 -N '' -C twilight -f work/ssh/ssh_host_ed25519_key
+	printf 'd\t700\t0\t0\t/private/var/root/.ssh\n' >> $O/root/etc/var.skel
+	for k in authorized_keys ssh_host_ed25519_key ssh_host_ed25519_key.pub; do
+		cp work/ssh/$k $O/root/etc/var/root/.ssh/$k
+		printf 'f\t600\t0\t0\t/private/var/root/.ssh/%s\t/etc/var/root/.ssh/%s\n' $k $k >> $O/root/etc/var.skel
+	done
+	for c in sh bash zsh; do
+		ln -s /var/jb/bin/$c $O/boot/jb-bin/$c
+	done
+	cp tvos/jb/com.twilight.sshd.plist tvos/jb/com.twilight.net.plist tvos/jb/com.twilight.jbprep.plist $O/root/LaunchDaemons/
+	cp tvos/jb/jb-prep.sh $O/root/etc/jb-prep.sh
+fi
+# JB=1: the prefix, for init to copy onto the data volume (hakios/userland/src/init.c, kept_prefix)
+if [ -n "$JB" ]; then
+	cp -a work/twl-jb/root/var/jb $O/root/jb
+	echo "build.sh: the prefix $(cat $O/root/jb/.jb-version) in the image, $(du -sh $O/root/jb | cut -f1) before compression"
+fi
 # the W2's Wi-Fi firmware for the kernel (fw/ of the small image; tools/w2-fw.py makes it from CoreELEC's file)
 if [ -d work/w2fw/bin ]; then
 	mkdir -p $O/root/fw && cp work/w2fw/bin/w2_*.bin $O/root/fw/
@@ -62,6 +98,12 @@ fi
 # the Mali-G310's CSF firmware (mali=2 and up): CoreELEC's arm/mali/arch10.8/mali_csffw.bin, the v10 image Amlogic runs on the S7D
 if [ -f work/malifw/mali_csffw.bin ]; then
 	mkdir -p $O/root/fw && cp work/malifw/mali_csffw.bin $O/root/fw/
+fi
+# the video decoders' microcode and the trusted application that loads it (optee=2): CoreELEC's, for the S905X5M
+VFW=work/src/ce-media-fw/usr/lib
+if [ -f $VFW/kernel-overlays/base/lib/firmware/video/S905X5M/video_ucode.bin ]; then
+	mkdir -p $O/root/fw && cp $VFW/kernel-overlays/base/lib/firmware/video/S905X5M/video_ucode.bin \
+		$VFW/ta/S905X5M/526fc4fc-7ee6-4a12-96e3-83da9565bce8.ta $O/root/fw/
 fi
 # the GPU's Metal plug-in (work/metalbuild: MaliMetal's, with PanVK inside), in /System/Library/Extensions through
 # the image's ext/ (init: a union mount); Metal loads it when the kernel's accelerator names it (metal=1)
@@ -83,6 +125,9 @@ for lib in ${TVLIBS-twlhook:backboardd twlpb:PineBoard twlbt:TVSettings}; do
 	cp $O/obj/lib$src.dylib $O/root/lib/
 	echo "/redwood/lib/lib$src.dylib ${progs//,/ }" >> $O/root/etc/inject.conf
 done
+# GLAPPS="Kodi ...": OpenGL ES by Mesa on the GPU (tvos/gpu/build-mesa-gl.sh) inside those apps. The libraries live on the box's /var
+# (tools/twl-gl-install.sh puts them there): 15 MB the image, which sits in memory, does not carry.
+[ -n "${GLAPPS-}" ] && echo "/var/mobile/gl/libhakios.gl.dylib $GLAPPS" >> $O/root/etc/inject.conf
 # programs of ours that are tvOS programs (dyld, libSystem): built the same way
 for prog in bluetool metaltest; do
 	$DYN -o $O/obj/$prog tvos/src/$prog.c
@@ -90,11 +135,18 @@ for prog in bluetool metaltest; do
 	$LDID -S -Cadhoc $O/obj/$prog          # (ad hoc: what the kernel's AMFI stand-in takes for a platform binary)
 	cp $O/obj/$prog $O/root/bin/
 done
-# the HDMI audio output (TVAUDIO=1; PASSTHROUGH=1 adds the AC-3 format): an AudioServerPlugIn for the audio server's HAL, in the image's
+# SSH=1: the phone's net_test, for en0's address (com.twilight.net)
+if [ -n "$SSH" ]; then
+	$DYN -fobjc-arc -framework Foundation -framework SystemConfiguration -o $O/obj/net_test $H/src/net_test.m
+	python3 tools/macho-tvos.py $O/obj/net_test
+	$LDID -S -Cadhoc $O/obj/net_test
+	cp $O/obj/net_test $O/root/bin/
+fi
+# the HDMI audio output (TVAUDIO=1; it offers AC-3 and MAT as well as LPCM, NOPASSTHROUGH=1 leaves those out): an AudioServerPlugIn for the audio server's HAL, in the image's
 # /hal, which init binds over Apple's plug-ins. It writes to /dev/twl-audio, which the kernel has with hdmitx=1 hdmiaudio=3.
 if [ -n "$TVAUDIO" ]; then
 	mkdir -p $O/root/lib/TwlAudio.driver
-	$DYN ${PASSTHROUGH:+-DTWL_PASSTHROUGH} -Ihakios/xnu/files/bsd/sys -bundle -framework CoreFoundation -o $O/obj/TwlAudio tvos/src/twlaudio.c
+	$DYN ${NOPASSTHROUGH:+-DTWL_NO_PASSTHROUGH} -Ihakios/xnu/files/bsd/sys -bundle -framework CoreFoundation -o $O/obj/TwlAudio tvos/src/twlaudio.c
 	python3 tools/macho-tvos.py $O/obj/TwlAudio
 	$LDID -S $O/obj/TwlAudio
 	cp $O/obj/TwlAudio $O/root/lib/TwlAudio.driver/
@@ -145,6 +197,6 @@ done
 
 python3 hakios/tools/apfs/mkapfs.py -z -o $O/root.apfs redwood=$O/root | tail -1
 python3 hakios/tools/apfs/mkapfs.py -o $O/boot.apfs Boot=$O/boot | tail -1
-python3 hakios/xnuloader/mkpayload.py -o out/payload-tvos.bin kernel=hakios/hakios-kernel \
+python3 hakios/xnuloader/mkpayload.py -o ${PAYLOAD:-out/payload-tvos.bin} kernel=hakios/hakios-kernel \
 	ramdisk=$O/boot.apfs ramdisk1=$O/root.apfs --no-version \
-	--cmdline "cpus=${CPUS:-3} emmc=1 root_apfs=emmc_darwin loader_return_after=${SECS:-180} epoch=$(date +%s) twl_hang=${HANG:-90} $ARGS"
+	--cmdline "cpus=${CPUS:-3} $EMMC root_apfs=emmc_darwin loader_return_after=${SECS:-180} epoch=$(date +%s) twl_hang=${HANG:-90} $ARGS"

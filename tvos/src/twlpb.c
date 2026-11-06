@@ -26,6 +26,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -175,6 +176,130 @@ start_rechecks(void)
 	dispatch_resume(timer);
 }
 
+/*
+ * Which applications the home screen shows: PineBoard's app-info policy asks -isApplicationEnabled:reasons: (and
+ * -isPlaceholderEnabled:reasons:) of each, and without an activation record, a storefront or Screen Time's policy
+ * daemon only Settings, Photos and Computers pass. Here each answer and its reasons (a bit mask, PBSAppInfo's
+ * disabledReasons) are logged once per application, and every application is enabled. -isApplicationHidden: is only
+ * logged: what Apple hides (What's New, the services) stays hidden.
+ */
+#define ENABLE_HOOKS 4
+static struct { Class cls; SEL sel; IMP original; } enable_hooks[ENABLE_HOOKS];
+static unsigned enable_hook_count;
+static char enable_seen[64][96];
+static unsigned enable_seen_count;
+
+static IMP
+enable_original(obj_t self, SEL sel)
+{
+	for (Class c = object_getClass((id)self); c != NULL; c = class_getSuperclass(c)) {
+		for (unsigned i = 0; i < enable_hook_count; i++) {
+			if (enable_hooks[i].cls == c && enable_hooks[i].sel == sel) {
+				return enable_hooks[i].original;
+			}
+		}
+	}
+	return NULL;
+}
+
+static void
+app_name(obj_t app, char *out, size_t size)
+{
+	obj_t name = NULL;
+
+	out[0] = 0;
+	if (app == NULL) {
+		strlcpy(out, "(nil)", size);
+		return;
+	}
+	if (((bool (*)(obj_t, SEL, SEL))objc_msgSend)(app, sel_registerName("respondsToSelector:"),
+	    sel_registerName("bundleIdentifier"))) {
+		name = SEND0(obj_t, app, "bundleIdentifier");
+	} else if (CFGetTypeID((CFTypeRef)app) == CFStringGetTypeID()) {
+		name = app;
+	}
+	if (name == NULL || !CFStringGetCString((CFStringRef)name, out, (CFIndex)size, kCFStringEncodingUTF8)) {
+		snprintf(out, size, "<%s>", object_getClassName((id)app));
+	}
+}
+
+static bool
+enable_first_time(const char *what, const char *name)
+{
+	char key[96];
+
+	snprintf(key, sizeof(key), "%s %s", what, name);
+	for (unsigned i = 0; i < enable_seen_count; i++) {
+		if (strcmp(enable_seen[i], key) == 0) {
+			return false;
+		}
+	}
+	if (enable_seen_count < 64) {
+		strlcpy(enable_seen[enable_seen_count++], key, sizeof(enable_seen[0]));
+	}
+	return true;
+}
+
+static bool
+is_enabled(obj_t self, SEL sel, obj_t app, uint64_t *reasons)
+{
+	bool (*original)(obj_t, SEL, obj_t, uint64_t *) = (bool (*)(obj_t, SEL, obj_t, uint64_t *))enable_original(self, sel);
+	uint64_t why = 0;
+	bool on = original != NULL ? original(self, sel, app, &why) : true;
+	char name[80];
+
+	app_name(app, name, sizeof(name));
+	if (enable_first_time(sel_getName(sel), name)) {
+		say("twl: %s %s: %s, reasons %#llx%s\n", sel_getName(sel), name, on ? "enabled" : "disabled",
+		    (unsigned long long)why, on ? "" : "; enabled here");
+	}
+	if (reasons != NULL) {
+		*reasons = 0;
+	}
+	return true;
+}
+
+static bool
+is_hidden(obj_t self, SEL sel, obj_t app)
+{
+	bool (*original)(obj_t, SEL, obj_t) = (bool (*)(obj_t, SEL, obj_t))enable_original(self, sel);
+	bool hidden = original != NULL ? original(self, sel, app) : false;
+	char name[80];
+
+	app_name(app, name, sizeof(name));
+	if (enable_first_time("hidden", name)) {
+		say("twl: isApplicationHidden: %s: %s\n", name, hidden ? "hidden" : "shown");
+	}
+	return hidden;
+}
+
+/* every class of PineBoard's own that implements SELECTOR itself */
+static void
+hook_pb_selector(const char *image, const char *selector, IMP replacement)
+{
+	unsigned count = 0;
+	const char **names = objc_copyClassNamesForImage(image, &count);
+	SEL sel = sel_registerName(selector);
+
+	for (unsigned i = 0; names != NULL && i < count; i++) {
+		Class cls = objc_getClass(names[i]);
+		unsigned n = 0;
+		Method *methods = cls != NULL ? class_copyMethodList(cls, &n) : NULL;
+
+		for (unsigned k = 0; k < n; k++) {
+			if (method_getName(methods[k]) == sel && enable_hook_count < ENABLE_HOOKS) {
+				enable_hooks[enable_hook_count].cls = cls;
+				enable_hooks[enable_hook_count].sel = sel;
+				enable_hooks[enable_hook_count].original = method_setImplementation(methods[k], replacement);
+				enable_hook_count++;
+				say("twl: -[%s %s] hooked\n", names[i], selector);
+			}
+		}
+		free(methods);
+	}
+	free(names);
+}
+
 __attribute__((constructor)) static void
 twl_pb_init(void)
 {
@@ -193,6 +318,9 @@ twl_pb_init(void)
 
 		if (name != NULL && strstr(name, "PineBoard.app/PineBoard") != NULL) {
 			pb_slide = (uintptr_t)_dyld_get_image_vmaddr_slide(i);
+			hook_pb_selector(name, "isApplicationEnabled:reasons:", (IMP)is_enabled);
+			hook_pb_selector(name, "isPlaceholderEnabled:reasons:", (IMP)is_enabled);
+			hook_pb_selector(name, "isApplicationHidden:", (IMP)is_hidden);
 		}
 	}
 	replace_method("SSDisplay", "setState:completion:", 0x1b3542ba8UL, (IMP)ss_display_set_state);

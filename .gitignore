@@ -13,3 +13,7 @@ logs/
 twloader/*.o
 twloader/*.elf
 twloader/*.Image
+probe/*/*.o
+probe/*/*.elf
+probe/*/*.Image
+probe/*/dummy-rd.gz
