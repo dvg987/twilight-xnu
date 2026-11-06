@@ -90,6 +90,17 @@ for prog in bluetool metaltest; do
 	$LDID -S -Cadhoc $O/obj/$prog          # (ad hoc: what the kernel's AMFI stand-in takes for a platform binary)
 	cp $O/obj/$prog $O/root/bin/
 done
+# the HDMI audio output (TVAUDIO=1; PASSTHROUGH=1 adds the AC-3 format): an AudioServerPlugIn for the audio server's HAL, in the image's
+# /hal, which init binds over Apple's plug-ins. It writes to /dev/twl-audio, which the kernel has with hdmitx=1 hdmiaudio=3.
+if [ -n "$TVAUDIO" ]; then
+	mkdir -p $O/root/lib/TwlAudio.driver
+	$DYN ${PASSTHROUGH:+-DTWL_PASSTHROUGH} -Ihakios/xnu/files/bsd/sys -bundle -framework CoreFoundation -o $O/obj/TwlAudio tvos/src/twlaudio.c
+	python3 tools/macho-tvos.py $O/obj/TwlAudio
+	$LDID -S $O/obj/TwlAudio
+	cp $O/obj/TwlAudio $O/root/lib/TwlAudio.driver/
+	cp tvos/src/twlaudio.plist $O/root/lib/TwlAudio.driver/Info.plist
+	ln -s /redwood/lib/TwlAudio.driver $O/root/hal/TwlAudio.driver
+fi
 # bluetoothd, one instruction changed: every pairing agent registers as one that answers pairing requests itself
 # (kCBMsgArgProgrammaticPairing), so a "Just Works" request goes to Settings' agent, which tvos/src/twlbt.c answers at
 # once, and not to an alert: the Xiaomi remote gives up on a pairing 3.4 s after asking for it. Signed again with its

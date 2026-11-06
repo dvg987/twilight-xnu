@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>com.twilight.audio</string>
+	<key>CFBundleName</key>
+	<string>TwlAudio</string>
+	<key>CFBundleExecutable</key>
+	<string>TwlAudio</string>
+	<key>CFBundlePackageType</key>
+	<string>BNDL</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>CFBundleSupportedPlatforms</key>
+	<array>
+		<string>AppleTVOS</string>
+	</array>
+	<!-- an AudioServerPlugIn: the type the HAL asks for, and the function that makes our driver (twlaudio.c) -->
+	<key>CFPlugInTypes</key>
+	<dict>
+		<key>443ABAB8-E7B3-491A-B985-BEB9187030DB</key>
+		<array>
+			<string>5A1D3C2E-8B47-4E19-A6F0-2C9D7B3E1A84</string>
+		</array>
+	</dict>
+	<key>CFPlugInFactories</key>
+	<dict>
+		<key>5A1D3C2E-8B47-4E19-A6F0-2C9D7B3E1A84</key>
+		<string>TwlAudio_Create</string>
+	</dict>
+</dict>
+</plist>
