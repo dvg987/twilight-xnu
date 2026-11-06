@@ -1,0 +1,88 @@
+Darwin build of Mesa 25.0.7's OSMesa with gallium panfrost (tvOS, Mali-G310).
+
+- meson.build: on Darwin with gallium panfrost, libdrm is MaliMetal's darwin-drm, found by pkg-config (build-mesa-gl.sh writes its
+  libdrm.pc): the libdrm stand-in that serves Panthor ioctls with calls of the kernel's MaliService (as for PanVK, panvk-patches/0001).
+- targets/osmesa/meson.build: the OSMesa library links gallium panfrost, xmlconfig (driconf defaults), the shim, and IOSurface.
+- util/os_mman.h: os_mmap/os_munmap go to drm_darwin_mmap/munmap (BO mappings are IOConnectMapMemory64, the flush-id page a zero
+  page, anything else the system's mmap): panvk-patches/0002 unchanged.
+- genxml/pan_pack_helpers.h: parenthesise the pointer in pan_pack macros (HakiOS S9 tools/mesa/panfrost-pack-pointer.patch).
+
+diff --git a/meson.build b/meson.build
+index 095aec5..ebc90dd 100644
+--- a/meson.build
++++ b/meson.build
+@@ -1711,6 +1711,10 @@ if system_has_kms_drm
+     'libdrm', version : '>=' + _drm_ver,
+     required : with_dri2 or with_dri or with_gbm
+   )
++elif host_machine.system() == 'darwin' and with_gallium_panfrost
++  # Darwin: gallium panfrost (OSMesa's GPU driver) talks Panthor ioctls and DRM syncobjs, which a userspace libdrm stand-in
++  # (MaliMetal's darwin-drm) serves in front of the kernel's MaliService IOKit user client. Found through the cross file's pkg-config.
++  dep_libdrm = dependency('libdrm', required : true)
+ else
+   # We should prevent libdrm from being available when the target doesn't have it to avoid transitive
+   # dependencies (such as vk-runtime) linking to it
+diff --git a/src/gallium/targets/osmesa/meson.build b/src/gallium/targets/osmesa/meson.build
+index 3c37161..793a2e7 100644
+--- a/src/gallium/targets/osmesa/meson.build
++++ b/src/gallium/targets/osmesa/meson.build
+@@ -5,6 +5,9 @@ osmesa_link_with = []
+ osmesa_link_args = []
+ osmesa_link_deps = []
+ 
++# Darwin: the IOSurfaces of glEGLImageTargetTexture2DOES (osmesa_target.c, pan_kmod.c)
++dep_iosurface = host_machine.system() == 'darwin' and with_gallium_panfrost ? declare_dependency(link_args : ['-framework', 'IOSurface']) : null_dep
++
+ if with_shared_glapi
+   osmesa_link_with += libglapi
+ endif
+@@ -39,6 +42,7 @@ libosmesa = shared_library(
+   ],
+   dependencies : [
+     dep_ws2_32, dep_thread, dep_clock, dep_unwind, driver_swrast, idep_mesautil,
++    driver_panfrost, idep_xmlconfig, dep_libdrm, dep_iosurface,
+   ],
+   name_prefix : host_machine.system() == 'windows' ? '' : [],  # otherwise mingw will create libosmesa.dll
+   soversion : host_machine.system() == 'windows' ? '' : '8',
+diff --git a/src/panfrost/lib/genxml/pan_pack_helpers.h b/src/panfrost/lib/genxml/pan_pack_helpers.h
+index 6355420..bc71317 100644
+--- a/src/panfrost/lib/genxml/pan_pack_helpers.h
++++ b/src/panfrost/lib/genxml/pan_pack_helpers.h
+@@ -98,10 +98,10 @@ __gen_padded(uint32_t v, uint32_t start, uint32_t end)
+         }))
+ 
+ #define pan_cast_and_pack(dst, T, name)                                        \
+-   pan_pack((PREFIX2(T, PACKED_T) *)dst, T, name)
++   pan_pack((PREFIX2(T, PACKED_T) *)(dst), T, name)
+ 
+ #define pan_cast_and_pack_nodefaults(dst, T, name)                             \
+-   pan_pack_nodefaults((PREFIX2(T, PACKED_T) *)dst, T, name)
++   pan_pack_nodefaults((PREFIX2(T, PACKED_T) *)(dst), T, name)
+ 
+ #define pan_unpack(src, T, name)                                               \
+    UNUSED struct PREFIX1(T) name;                                              \
+diff --git a/src/util/os_mman.h b/src/util/os_mman.h
+index 1567ee7..00e3de9 100644
+--- a/src/util/os_mman.h
++++ b/src/util/os_mman.h
+@@ -51,7 +51,19 @@ extern "C" {
+ #endif
+ 
+ 
+-#if DETECT_OS_ANDROID && !defined(__LP64__)
++#if DETECT_OS_APPLE
++/* Darwin: the "DRM fd" of PanVK is served by a libdrm stand-in (darwin-drm) that turns the mmap offset of a buffer object into an
++ * IOConnectMapMemory64 and falls back to mmap() for every other descriptor. */
++extern void *drm_darwin_mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset);
++extern int drm_darwin_munmap(void *addr, size_t length);
++
++#  define os_mmap(addr, length, prot, flags, fd, offset) \
++             drm_darwin_mmap(addr, length, prot, flags, fd, offset)
++
++#  define os_munmap(addr, length) \
++             drm_darwin_munmap(addr, length)
++
++#elif DETECT_OS_ANDROID && !defined(__LP64__)
+ /* 32-bit needs mmap64 for 64-bit offsets */
+ #  define os_mmap(addr, length, prot, flags, fd, offset) \
+              mmap64(addr, length, prot, flags, fd, offset)

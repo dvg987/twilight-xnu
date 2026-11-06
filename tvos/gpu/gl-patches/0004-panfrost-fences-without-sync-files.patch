@@ -1,0 +1,81 @@
+panfrost fences on Darwin without sync files.
+
+darwin-drm keeps syncobjs in the process and has no sync files (drmSyncobjExport/ImportSyncFile return ENOSYS), which gallium
+panfrost uses for every fence (glFinish, glFenceSync):
+- pan_fence.c: panfrost_fence_create() snapshots the context's syncobj into a new one with drmSyncobjTransfer().
+- pan_context.c: fence_server_sync (glWaitSync) waits on the CPU (drmSyncobjWait) instead of handing the GPU a sync file.
+
+diff --git a/src/gallium/drivers/panfrost/pan_context.c b/src/gallium/drivers/panfrost/pan_context.c
+index fbf2e3d..89264f6 100644
+--- a/src/gallium/drivers/panfrost/pan_context.c
++++ b/src/gallium/drivers/panfrost/pan_context.c
+@@ -29,6 +29,7 @@
+ #include <poll.h>
+ 
+ #include "pan_bo.h"
++#include "util/detect_os.h"
+ #include "pan_context.h"
+ #include "pan_minmax_cache.h"
+ 
+@@ -987,6 +988,16 @@ panfrost_fence_server_sync(struct pipe_context *pctx,
+    struct panfrost_context *ctx = pan_context(pctx);
+    int fd = -1, ret;
+ 
++#if DETECT_OS_APPLE
++   /* No sync files on Darwin: the GPU cannot be told to wait for another context's fence, so this processor waits for it. */
++   (void)ctx;
++   (void)fd;
++   (void)ret;
++   drmSyncobjWait(panfrost_device_fd(dev), &f->syncobj, 1, INT64_MAX,
++                  DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, NULL);
++   return;
++#endif
++
+    ret = drmSyncobjExportSyncFile(panfrost_device_fd(dev), f->syncobj, &fd);
+    assert(!ret);
+ 
+diff --git a/src/gallium/drivers/panfrost/pan_fence.c b/src/gallium/drivers/panfrost/pan_fence.c
+index f3c9e14..e487ccf 100644
+--- a/src/gallium/drivers/panfrost/pan_fence.c
++++ b/src/gallium/drivers/panfrost/pan_fence.c
+@@ -30,6 +30,7 @@
+ #include "pan_context.h"
+ #include "pan_screen.h"
+ 
++#include "util/detect_os.h"
+ #include "util/os_time.h"
+ #include "util/u_inlines.h"
+ 
+@@ -129,6 +130,32 @@ panfrost_fence_create(struct panfrost_context *ctx)
+    struct panfrost_device *dev = pan_device(ctx->base.screen);
+    int fd = -1, ret;
+ 
++#if DETECT_OS_APPLE
++   /* No sync files on Darwin (darwin-drm keeps syncobjs in the process): the snapshot is a syncobj of its own that the context's
++    * fence is transferred into. */
++   {
++      struct pipe_fence_handle *f = calloc(1, sizeof(*f));
++      if (!f)
++         return NULL;
++      ret = drmSyncobjCreate(panfrost_device_fd(dev), 0, &f->syncobj);
++      if (ret) {
++         free(f);
++         return NULL;
++      }
++      ret = drmSyncobjTransfer(panfrost_device_fd(dev), f->syncobj, 0,
++                               ctx->syncobj, 0, 0);
++      if (ret) {
++         mesa_loge("fence snapshot failed (%d)", ret);
++         drmSyncobjDestroy(panfrost_device_fd(dev), f->syncobj);
++         free(f);
++         return NULL;
++      }
++      pipe_reference_init(&f->reference, 1);
++      (void)fd;
++      return f;
++   }
++#endif
++
+    /* Snapshot the last rendering out fence. We'd rather have another
+     * syncobj instead of a sync file, but this is all we get.
+     * (HandleToFD/FDToHandle just gives you another syncobj ID for the

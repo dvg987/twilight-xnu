@@ -1,0 +1,229 @@
+OSMesa takes the GPU, makes OpenGL ES contexts, and imports IOSurfaces as EGL images.
+
+- GL/osmesa.h, frontends/osmesa/osmesa.c: OSMESA_ES_PROFILE (0x38) makes an OpenGL ES 2/3 context (HakiOS osmesa-es-profile.patch).
+- frontends/osmesa/osmesa.c: get_egl_image/validate_egl_image: the "EGLImage" of glEGLImageTargetTexture2DOES is an IOSurface ID
+  (HakiOS freedreno-darwin.patch), resolved by osmesa_surface_resource().
+- targets/osmesa/osmesa_target.c: the screen is gallium panfrost on drm_darwin_open_render()'s descriptor when MaliService exists
+  (softpipe otherwise, or with OSMESA_SOFTWARE=1; OSMESA_DEBUG_GPU=1 prints why the GPU was not taken). osmesa_surface_resource()
+  makes a linear B8G8R8A8 resource of a 'BGRA', single-plane IOSurface (resource_from_handle with the ID as the "fd").
+  Unlike the S9 (hakios-drm, panfrost kmod, its kernel's own surface request) this goes through darwin-drm and panthor.
+
+diff --git a/include/GL/osmesa.h b/include/GL/osmesa.h
+index 5d15f0b..e2913a1 100644
+--- a/include/GL/osmesa.h
++++ b/include/GL/osmesa.h
+@@ -106,6 +106,7 @@ extern "C" {
+ #define OSMESA_COMPAT_PROFILE        0x35
+ #define OSMESA_CONTEXT_MAJOR_VERSION 0x36
+ #define OSMESA_CONTEXT_MINOR_VERSION 0x37
++#define OSMESA_ES_PROFILE            0x38  /* an OpenGL ES 2 or 3 context, by the version asked for */
+ 
+ 
+ typedef struct osmesa_context *OSMesaContext;
+diff --git a/src/gallium/frontends/osmesa/osmesa.c b/src/gallium/frontends/osmesa/osmesa.c
+index 6d61677..48f4b8e 100644
+--- a/src/gallium/frontends/osmesa/osmesa.c
++++ b/src/gallium/frontends/osmesa/osmesa.c
+@@ -86,6 +86,9 @@
+ extern struct pipe_screen *
+ osmesa_create_screen(void);
+ 
++extern struct pipe_resource *
++osmesa_surface_resource(struct pipe_screen *screen, uint32_t surface);
++
+ 
+ 
+ struct osmesa_buffer
+@@ -152,6 +155,28 @@ destroy_st_manager(void)
+    }
+ }
+ 
++/*
++ * There is no EGL here. What glEGLImageTargetTexture2DOES is given as an image is the ID of an IOSurface, whose memory becomes the
++ * texture's where the driver can do that (gallium panfrost on Darwin: targets/osmesa/osmesa_target.c).
++ */
++static bool
++osmesa_st_get_egl_image(struct pipe_frontend_screen *fscreen, void *image,
++                        struct st_egl_image *out)
++{
++   out->texture = osmesa_surface_resource(fscreen->screen,
++                                          (uint32_t)(uintptr_t)image);
++   if (!out->texture)
++      return false;
++   out->format = out->texture->format;
++   return true;
++}
++
++static bool
++osmesa_st_validate_egl_image(struct pipe_frontend_screen *fscreen, void *image)
++{
++   return true;
++}
++
+ static void
+ create_st_manager(void)
+ {
+@@ -162,7 +187,8 @@ create_st_manager(void)
+    if (global_fscreen) {
+       global_fscreen->screen = osmesa_create_screen();
+       global_fscreen->get_param = osmesa_st_get_param;
+-      global_fscreen->get_egl_image = NULL;
++      global_fscreen->get_egl_image = osmesa_st_get_egl_image;
++      global_fscreen->validate_egl_image = osmesa_st_validate_egl_image;
+    }
+ }
+ 
+@@ -615,7 +641,8 @@ OSMesaCreateContextAttribs(const int *attribList, OSMesaContext sharelist)
+       case OSMESA_PROFILE:
+          profile = attribList[i+1];
+          if (profile != OSMESA_CORE_PROFILE &&
+-             profile != OSMESA_COMPAT_PROFILE)
++             profile != OSMESA_COMPAT_PROFILE &&
++             profile != OSMESA_ES_PROFILE)
+             return NULL;
+          break;
+       case OSMESA_CONTEXT_MAJOR_VERSION:
+@@ -662,8 +689,8 @@ OSMesaCreateContextAttribs(const int *attribList, OSMesaContext sharelist)
+     * Create the rendering context
+     */
+    memset(&attribs, 0, sizeof(attribs));
+-   attribs.profile = (profile == OSMESA_CORE_PROFILE)
+-      ? API_OPENGL_CORE : API_OPENGL_COMPAT;
++   attribs.profile = (profile == OSMESA_ES_PROFILE) ? API_OPENGLES2 :
++      (profile == OSMESA_CORE_PROFILE) ? API_OPENGL_CORE : API_OPENGL_COMPAT;
+    attribs.major = version_major;
+    attribs.minor = version_minor;
+    attribs.flags = 0;  /* ST_CONTEXT_FLAG_x */
+diff --git a/src/gallium/targets/osmesa/osmesa_target.c b/src/gallium/targets/osmesa/osmesa_target.c
+index 25985dd..364a773 100644
+--- a/src/gallium/targets/osmesa/osmesa_target.c
++++ b/src/gallium/targets/osmesa/osmesa_target.c
+@@ -25,6 +25,115 @@
+ #include "target-helpers/inline_debug_helper.h"
+ 
+ #include "sw/null/null_sw_winsys.h"
++#include "drm-uapi/drm_fourcc.h"
++#include <stdio.h>
++#include <string.h>
++#include <unistd.h>
++
++
++#include "frontend/winsys_handle.h"
++#include "pipe/p_screen.h"
++#include "pipe/p_state.h"
++
++#ifdef GALLIUM_PANFROST
++/*
++ * Darwin (tvOS on the Mi Box S Gen 3): the GPU's driver is gallium panfrost (Mali-G310, Valhall v10, CSF), and its "DRM device" is
++ * MaliMetal's darwin-drm, a libdrm stand-in that serves the Panthor ioctls with calls of the kernel's MaliService IOKit user client
++ * (hakios.mali_uapi.h). drm_darwin_open_render() hands out the descriptor (a /dev/null that stands for the one connection a process has).
++ */
++#include <errno.h>
++#include <IOSurface/IOSurfaceRef.h>
++#include "panfrost/drm/panfrost_drm_public.h"
++#include "util/driconf.h"
++#include "util/xmlconfig.h"
++#include <xf86drm.h>
++
++static const driOptionDescription panfrost_options[] = {
++#include "panfrost/driinfo_panfrost.h"
++};
++
++static struct pipe_screen *gpu_screen;
++
++/* The GPU's screen; NULL: no MaliService (QEMU, a kernel without mali=), or OSMESA_SOFTWARE=1. */
++static struct pipe_screen *
++osmesa_create_gpu_screen(void)
++{
++   static driOptionCache info, cache;
++   static struct pipe_screen_config config;
++   struct pipe_screen *screen;
++   int fd;
++
++   if (debug_get_bool_option("OSMESA_SOFTWARE", false))
++      return NULL;
++   fd = drm_darwin_open_render();
++   if (fd < 0) {
++      if (debug_get_bool_option("OSMESA_DEBUG_GPU", false))
++         fprintf(stderr, "osmesa: no Mali (MaliService): %s; software rendering\n", strerror(errno));
++      return NULL;
++   }
++   driParseOptionInfo(&info, panfrost_options, ARRAY_SIZE(panfrost_options));
++   driParseConfigFiles(&cache, &info, 0, "panfrost", NULL, NULL, NULL, 0, NULL, 0);
++   config.options = &cache;
++   config.options_info = &info;
++   /* (the winsys takes a duplicate of the descriptor for itself) */
++   screen = panfrost_drm_screen_create(fd, &config);
++   close(fd);
++   if (!screen) {
++      fprintf(stderr, "osmesa: MaliService is there but panfrost made no screen of it; software rendering\n");
++      return NULL;
++   }
++   gpu_screen = screen;
++   return debug_screen_wrap(screen);
++}
++#endif
++
++
++struct pipe_resource *
++osmesa_surface_resource(struct pipe_screen *screen, uint32_t surface);
++
++/*
++ * The memory of an IOSurface as a texture, to draw into and to draw with: there is no EGL here, so what
++ * glEGLImageTargetTexture2DOES is given as an image is the ID of an IOSurface (frontends/osmesa/osmesa.c). The kernel makes a
++ * buffer object of the surface's pages (MALI_BO_CREATE_HOST, through panfrost_bo_import(): pan_kmod_bo_import_iosurface()).
++ * NULL: the screen is not the GPU's, or the surface is not one plane of 32-bit pixels, blue first, in rows the GPU can address.
++ */
++struct pipe_resource *
++osmesa_surface_resource(struct pipe_screen *screen, uint32_t surface)
++{
++#ifdef GALLIUM_PANFROST
++   struct pipe_resource templ = {
++      .target = PIPE_TEXTURE_2D,
++      .format = PIPE_FORMAT_B8G8R8A8_UNORM,
++      .depth0 = 1,
++      .array_size = 1,
++      .bind = PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_RENDER_TARGET,
++   };
++   struct winsys_handle handle = { .type = WINSYS_HANDLE_TYPE_FD, .modifier = DRM_FORMAT_MOD_INVALID };
++   IOSurfaceRef s;
++
++   if (!gpu_screen || !screen)
++      return NULL;
++   s = IOSurfaceLookup(surface);
++   if (!s)
++      return NULL;
++   bool ok = IOSurfaceGetPixelFormat(s) == 0x42475241 /* 'BGRA' */ && IOSurfaceGetPlaneCount(s) == 0 &&
++             IOSurfaceGetBytesPerElement(s) == 4;
++   templ.width0 = IOSurfaceGetWidth(s);
++   templ.height0 = IOSurfaceGetHeight(s);
++   handle.stride = IOSurfaceGetBytesPerRow(s);
++   CFRelease(s);
++   if (!ok)
++      return NULL;
++   /* (the surface comes in as Linux's buffers come in by file descriptor: its ID in place of the descriptor) */
++   handle.handle = surface;
++   handle.offset = 0;
++   return screen->resource_from_handle(screen, &templ, &handle, 0);
++#else
++   (void)screen;
++   (void)surface;
++   return NULL;
++#endif
++}
+ 
+ 
+ struct pipe_screen *
+@@ -37,6 +146,12 @@ osmesa_create_screen(void)
+    struct sw_winsys *winsys;
+    struct pipe_screen *screen;
+ 
++#ifdef GALLIUM_PANFROST
++   screen = osmesa_create_gpu_screen();
++   if (screen)
++      return screen;
++#endif
++
+    /* We use a null software winsys since we always just render to ordinary
+     * driver resources.
+     */

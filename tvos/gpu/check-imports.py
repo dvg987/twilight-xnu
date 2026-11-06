@@ -9,7 +9,7 @@ import os, re, subprocess, sys
 
 binary, tbd_dir = sys.argv[1], sys.argv[2]
 # llvm-nm -m names the library by its short name ("libSystem", "Foundation", "libc++").
-SHORT = {'libSystem': 'libSystem.B.dylib', 'libc++': 'libc++.1.dylib', 'libobjc': 'libobjc.A.dylib', 'libc++abi': 'libc++abi.dylib'}
+SHORT = {'libSystem': 'libSystem.B.dylib', 'libc++': 'libc++.1.dylib', 'libobjc': 'libobjc.A.dylib', 'libc++abi': 'libc++abi.dylib', 'libz': 'libz.1.dylib'}
 
 def exports(path):
     text = open(path).read()

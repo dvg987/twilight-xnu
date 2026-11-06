@@ -1,0 +1,27 @@
+--- a/drm_darwin.c
++++ b/drm_darwin.c
+@@ -62,6 +62,7 @@
+    case kIOReturnBusy: return EBUSY;
+    case kIOReturnNotFound: return ENOENT;
+    case kIOReturnTimeout: return ETIMEDOUT;
++   case kIOReturnAborted: return ECANCELED;   /* a group the kernel's hang watchdog took off the GPU */
+    case kIOReturnNotPermitted:
+    case kIOReturnNotPrivileged: return EPERM;
+    default: return EIO;
+@@ -1079,9 +1080,16 @@
+       ret = ioctl_group_submit(arg);
+       break;
+    case DRM_IOCTL_PANTHOR_GROUP_GET_STATE: {
++      /* the kernel's hang watchdog marks a stuck group timed out; Mesa then makes itself a new context. An older kernel has no such call: usable. */
+       struct drm_panthor_group_get_state *a = arg;
++      struct mali_group_destroy_in in = {a->group_handle, 0};
++      struct mali_group_state_out out = {0, 0};
+       a->state = 0;
+       a->fatal_queues = 0;
++      if (kcall(MALI_GROUP_STATE, &in, sizeof in, &out, sizeof out) == KERN_SUCCESS) {
++         a->state = out.state & MALI_GROUP_STATE_TIMEDOUT ? DRM_PANTHOR_GROUP_STATE_TIMEDOUT : 0;
++         a->fatal_queues = out.fatal_queues;
++      }
+       ret = 0;
+       break;
+    }

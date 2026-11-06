@@ -1,0 +1,258 @@
+panfrost on Darwin: an imported buffer is an IOSurface's pages, and there is no implicit sync.
+
+- kmod/pan_kmod.[ch]: pan_kmod_bo_import_iosurface(): IOSurfaceLookup, clean+invalidate the CPU cache over the surface (DC CIVAC
+  by line: the GPU is not coherent, and libSystem's sys_dcache_flush only cleans here), then drm_darwin_bo_create_host()
+  (MALI_BO_CREATE_HOST, the host-pointer import PanVK uses for Metal's IOSurfaces) makes a BO of the pages; the BO holds the
+  surface until it is freed (pan_kmod_bo_put).
+- gallium/drivers/panfrost/pan_bo.c: panfrost_bo_import() takes that path instead of drmPrimeFDToHandle()/lseek() (no dma-bufs;
+  darwin-drm's PRIME calls return ENOSYS).
+- kmod/panthor_kmod.c: imported/exported BOs are not "shared" on Darwin: no DMA_BUF sync-file dance (no dma-bufs, no sync files);
+  they use their own timeline syncobj like a shareable BO, created signaled (an unsignaled binary syncobj with no fence would make
+  darwin-drm's GROUP_SUBMIT wait for ever).
+
+diff --git a/src/gallium/drivers/panfrost/pan_bo.c b/src/gallium/drivers/panfrost/pan_bo.c
+index 712987e..c40d164 100644
+--- a/src/gallium/drivers/panfrost/pan_bo.c
++++ b/src/gallium/drivers/panfrost/pan_bo.c
+@@ -482,14 +482,30 @@ panfrost_bo_import(struct panfrost_device *dev, int fd)
+    unsigned gem_handle;
+ 
+    pthread_mutex_lock(&dev->bo_map_lock);
++#ifdef __APPLE__
++   /* (the "file descriptor" is an IOSurface's ID: pan_kmod_bo_import_iosurface(); every import is a new buffer object) */
++   struct pan_kmod_bo *surface_bo =
++      pan_kmod_bo_import_iosurface(dev->kmod.dev, (uint32_t)fd);
++   if (!surface_bo) {
++      pthread_mutex_unlock(&dev->bo_map_lock);
++      return NULL;
++   }
++   gem_handle = pan_kmod_bo_handle(surface_bo);
++   (void)ret;
++#else
+    ret = drmPrimeFDToHandle(dev->kmod.dev->fd, fd, &gem_handle);
+    assert(!ret);
++#endif
+ 
+    bo = pan_lookup_bo(dev, gem_handle);
+ 
+    if (!bo->dev) {
+       bo->dev = dev;
++#ifdef __APPLE__
++      bo->kmod_bo = surface_bo;
++#else
+       bo->kmod_bo = pan_kmod_bo_import(dev->kmod.dev, fd, 0);
++#endif
+ 
+       struct pan_kmod_vm_op vm_op = {
+          .type = PAN_KMOD_VM_OP_TYPE_MAP,
+diff --git a/src/panfrost/lib/kmod/pan_kmod.c b/src/panfrost/lib/kmod/pan_kmod.c
+index b69e2ef..79d6abc 100644
+--- a/src/panfrost/lib/kmod/pan_kmod.c
++++ b/src/panfrost/lib/kmod/pan_kmod.c
+@@ -11,6 +11,12 @@
+ #include "util/macros.h"
+ #include "pan_kmod.h"
+ 
++#ifdef __APPLE__
++#include <errno.h>
++#include <IOSurface/IOSurfaceRef.h>
++#include "util/u_math.h"
++#endif
++
+ extern const struct pan_kmod_ops panfrost_kmod_ops;
+ extern const struct pan_kmod_ops panthor_kmod_ops;
+ 
+@@ -132,12 +138,87 @@ pan_kmod_bo_put(struct pan_kmod_bo *bo)
+ 
+       assert(slot);
+       *slot = NULL;
++#ifdef __APPLE__
++      const void *surface = bo->darwin_surface;
++#endif
+       bo->dev->ops->bo_free(bo);
++#ifdef __APPLE__
++      /* (after the kernel let go of the pages: BO_DESTROY in bo_free) */
++      if (surface)
++         CFRelease(surface);
++#endif
+    }
+ 
+    simple_mtx_unlock(&dev->handle_to_bo.lock);
+ }
+ 
++#ifdef __APPLE__
++/* Clean AND invalidate to the point of coherency, DC CIVAC by line. Not libSystem's sys_dcache_flush(), which only cleans on this
++ * system (MaliMetal measured stale reads after GPU writes with it: NativeBridgeMetalFrontend.mm). EL0 may: SCTLR_EL1.UCI; the line
++ * size from CTR_EL0 (SCTLR_EL1.UCT). */
++static void
++pan_darwin_dcache_civac(void *start, size_t length)
++{
++   uint64_t ctr;
++   __asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
++   const size_t line = 4u << ((ctr >> 16) & 0xf);
++   for (uintptr_t p = (uintptr_t)start & ~(uintptr_t)(line - 1);
++        p < (uintptr_t)start + length; p += line)
++      __asm__ volatile("dc civac, %0" : : "r"(p) : "memory");
++   __asm__ volatile("dsb sy" : : : "memory");
++}
++
++struct pan_kmod_bo *
++pan_kmod_bo_import_iosurface(struct pan_kmod_dev *dev, uint32_t surface_id)
++{
++   IOSurfaceRef surface = IOSurfaceLookup(surface_id);
++   struct pan_kmod_bo *bo = NULL;
++   struct pan_kmod_bo **slot;
++   uint32_t handle;
++
++   if (!surface)
++      return NULL;
++
++   void *base = IOSurfaceGetBaseAddress(surface);
++   size_t size = ALIGN_POT(IOSurfaceGetAllocSize(surface), 4096);
++   if (!base || ((uintptr_t)base & 4095) || !size) {
++      mesa_loge("IOSurface %u: memory at %p, %zu bytes: not whole pages", surface_id, base, size);
++      goto err_release;
++   }
++
++   /* The GPU is not coherent with this processor's caches, and the surface's mapping here may be cached: what this process wrote
++    * goes to memory before the GPU reads it, and no line is left that could be written back over what the GPU draws. */
++   pan_darwin_dcache_civac(base, size);
++
++   simple_mtx_lock(&dev->handle_to_bo.lock);
++   if (drm_darwin_bo_create_host(dev->fd, base, size, &handle)) {
++      mesa_loge("IOSurface %u: the kernel made no buffer object of it (err=%d)", surface_id, errno);
++      goto err_unlock;
++   }
++
++   slot = util_sparse_array_get(&dev->handle_to_bo.array, handle);
++   if (!slot || *slot)
++      goto err_close_handle;
++
++   bo = dev->ops->bo_import(dev, handle, size, 0);
++   if (!bo)
++      goto err_close_handle;
++
++   bo->darwin_surface = surface;
++   *slot = bo;
++   simple_mtx_unlock(&dev->handle_to_bo.lock);
++   return bo;
++
++err_close_handle:
++   drmCloseBufferHandle(dev->fd, handle);
++err_unlock:
++   simple_mtx_unlock(&dev->handle_to_bo.lock);
++err_release:
++   CFRelease(surface);
++   return NULL;
++}
++#endif
++
+ static bool
+ pan_kmod_bo_check_import_flags(struct pan_kmod_bo *bo, uint32_t flags)
+ {
+diff --git a/src/panfrost/lib/kmod/pan_kmod.h b/src/panfrost/lib/kmod/pan_kmod.h
+index 8b809d4..359c2f5 100644
+--- a/src/panfrost/lib/kmod/pan_kmod.h
++++ b/src/panfrost/lib/kmod/pan_kmod.h
+@@ -144,6 +144,11 @@ struct pan_kmod_bo {
+ 
+    /* User private data. Use pan_kmod_bo_{set,get}_user_priv() to access it. */
+    void *user_priv;
++
++#ifdef __APPLE__
++   /* An IOSurface whose pages the buffer object is (pan_kmod_bo_import_iosurface()): held while the BO lives. */
++   const void *darwin_surface;
++#endif
+ };
+ 
+ /* List of GPU properties needed by the UMD. */
+@@ -560,6 +565,14 @@ pan_kmod_bo_get_user_priv(const struct pan_kmod_bo *bo)
+ struct pan_kmod_bo *pan_kmod_bo_import(struct pan_kmod_dev *dev, int fd,
+                                        uint32_t flags);
+ 
++#ifdef __APPLE__
++/* No dma-bufs on Darwin: what comes in is an IOSurface, by its ID. The kernel makes a buffer object of the surface's own pages
++ * (darwin-drm's drm_darwin_bo_create_host(), MALI_BO_CREATE_HOST); the BO holds a reference to the surface. NULL: no such surface,
++ * its memory is not whole pages, or the kernel refused. */
++struct pan_kmod_bo *pan_kmod_bo_import_iosurface(struct pan_kmod_dev *dev,
++                                                 uint32_t surface_id);
++#endif
++
+ static inline int
+ pan_kmod_bo_export(struct pan_kmod_bo *bo)
+ {
+diff --git a/src/panfrost/lib/kmod/panthor_kmod.c b/src/panfrost/lib/kmod/panthor_kmod.c
+index 6254f01..a4d1ce5 100644
+--- a/src/panfrost/lib/kmod/panthor_kmod.c
++++ b/src/panfrost/lib/kmod/panthor_kmod.c
+@@ -9,6 +9,7 @@
+ #include <string.h>
+ #include <xf86drm.h>
+ 
++#include "util/detect_os.h"
+ #include "util/hash_table.h"
+ #include "util/libsync.h"
+ #include "util/macros.h"
+@@ -399,7 +400,9 @@ panthor_kmod_bo_import(struct pan_kmod_dev *dev, uint32_t handle, size_t size,
+    /* Create a unsignalled syncobj on import. Will serve as a
+     * temporary container for the exported dmabuf sync file.
+     */
+-   int ret = drmSyncobjCreate(dev->fd, 0, &panthor_bo->sync.handle);
++   /* (Darwin: signaled, since it is the BO's timeline from the start, as a shareable BO's is) */
++   int ret = drmSyncobjCreate(dev->fd, DETECT_OS_APPLE ? DRM_SYNCOBJ_CREATE_SIGNALED : 0,
++                              &panthor_bo->sync.handle);
+    if (ret) {
+       mesa_loge("drmSyncobjCreate() failed (err=%d)", errno);
+       goto err_free_bo;
+@@ -420,8 +423,10 @@ panthor_kmod_bo_export(struct pan_kmod_bo *bo, int dmabuf_fd)
+    struct panthor_kmod_bo *panthor_bo =
+       container_of(bo, struct panthor_kmod_bo, base);
+ 
+-   bool shared =
+-      bo->flags & (PAN_KMOD_BO_FLAG_EXPORTED | PAN_KMOD_BO_FLAG_IMPORTED);
++   /* Darwin: no dma-bufs and no implicit sync. An imported BO (an IOSurface's pages) is synchronized like a shareable one of
++    * our own, through its timeline syncobj; whoever else uses the surface waits for this process's work explicitly. */
++   bool shared = !DETECT_OS_APPLE &&
++      (bo->flags & (PAN_KMOD_BO_FLAG_EXPORTED | PAN_KMOD_BO_FLAG_IMPORTED));
+ 
+    /* If the BO wasn't already shared, we migrate our internal sync points to
+     * the dmabuf itself, so implicit sync can work correctly after this point.
+@@ -483,8 +488,10 @@ panthor_kmod_bo_wait(struct pan_kmod_bo *bo, int64_t timeout_ns,
+ {
+    struct panthor_kmod_bo *panthor_bo =
+       container_of(bo, struct panthor_kmod_bo, base);
+-   bool shared =
+-      bo->flags & (PAN_KMOD_BO_FLAG_EXPORTED | PAN_KMOD_BO_FLAG_IMPORTED);
++   /* Darwin: no dma-bufs and no implicit sync. An imported BO (an IOSurface's pages) is synchronized like a shareable one of
++    * our own, through its timeline syncobj; whoever else uses the surface waits for this process's work explicitly. */
++   bool shared = !DETECT_OS_APPLE &&
++      (bo->flags & (PAN_KMOD_BO_FLAG_EXPORTED | PAN_KMOD_BO_FLAG_IMPORTED));
+ 
+    if (shared) {
+       /* If the object is shared, we have to do this export sync-file dance
+@@ -556,8 +563,10 @@ panthor_kmod_bo_attach_sync_point(struct pan_kmod_bo *bo, uint32_t sync_handle,
+       bo->exclusive_vm
+          ? container_of(bo->exclusive_vm, struct panthor_kmod_vm, base)
+          : NULL;
+-   bool shared =
+-      bo->flags & (PAN_KMOD_BO_FLAG_EXPORTED | PAN_KMOD_BO_FLAG_IMPORTED);
++   /* Darwin: no dma-bufs and no implicit sync. An imported BO (an IOSurface's pages) is synchronized like a shareable one of
++    * our own, through its timeline syncobj; whoever else uses the surface waits for this process's work explicitly. */
++   bool shared = !DETECT_OS_APPLE &&
++      (bo->flags & (PAN_KMOD_BO_FLAG_EXPORTED | PAN_KMOD_BO_FLAG_IMPORTED));
+ 
+    if (shared) {
+       /* Reconciling explicit/implicit sync again: we need to import the
+@@ -628,8 +637,10 @@ panthor_kmod_bo_get_sync_point(struct pan_kmod_bo *bo, uint32_t *sync_handle,
+ {
+    struct panthor_kmod_bo *panthor_bo =
+       container_of(bo, struct panthor_kmod_bo, base);
+-   bool shared =
+-      bo->flags & (PAN_KMOD_BO_FLAG_EXPORTED | PAN_KMOD_BO_FLAG_IMPORTED);
++   /* Darwin: no dma-bufs and no implicit sync. An imported BO (an IOSurface's pages) is synchronized like a shareable one of
++    * our own, through its timeline syncobj; whoever else uses the surface waits for this process's work explicitly. */
++   bool shared = !DETECT_OS_APPLE &&
++      (bo->flags & (PAN_KMOD_BO_FLAG_EXPORTED | PAN_KMOD_BO_FLAG_IMPORTED));
+ 
+    if (shared) {
+       /* Explicit/implicit sync reconciliation point. We need to export
