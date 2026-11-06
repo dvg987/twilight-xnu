@@ -7,7 +7,10 @@
  * This one presents a single output device whose UID is "HDMI", the name the virtual audio device (VirtualAudio.plugin,
  * Device_HDMI) builds the HDMI output port from. Its samples go to the kernel (/dev/twl-audio, hakios.hdmiaudio.c), which feeds the
  * HDMI transmitter. The stream offers 16-bit LPCM at 48 kHz in the channel counts the TV or receiver lists in its EDID (2, then 6 and
- * 8), and, built with -DTWL_PASSTHROUGH, the non-mixable AC-3 format tvOS asks for with "Change Format". The device clock is the
+ * 8), and the two non-mixable formats tvOS sets on a device (read from MediaExperience's CMVAEndptMgr): 'cac3' (AC-3 in IEC 60958, 48 kHz,
+ * 2 x 16 bit, 1536 frames = 6144 bytes a packet; Settings > Audio Format > Change Format > Dolby Digital 5.1) and 'mtb+' (Dolby MAT, the
+ * Atmos carrier: 32 channels x 16 bit at 48 kHz, 960 frames = 61440 bytes a packet, which is the 8-channel 192 kHz HBR stream byte for byte).
+ * Built without -DTWL_NO_PASSTHROUGH. The device clock is the
  * kernel's: the frames the hardware has taken.
  * Every format the audio server asks for is logged (stderr), because what tvOS asks for first is what settles the rest.
  */
@@ -161,8 +164,13 @@ enum { OBJECT_PLUGIN = 1, OBJECT_DEVICE, OBJECT_STREAM, OBJECT_VOLUME, OBJECT_LA
 /* The physical formats the stream offers: linear PCM in the channel counts the sink takes, and (TWL_PASSTHROUGH) AC-3 */
 struct pformat {
 	UInt32 id, flags, channels, kind;
+	UInt32 bytes_per_packet, frames_per_packet, bytes_per_frame;
+	UInt32 hw_channels, hw_rate, rate_div;          /* what the kernel is told, and how many of its frames make one of ours */
 };
+#define PCM_FORMAT(ch) { kAudioFormatLinearPCM, pcm_flags, ch, TWL_AUDIO_PCM, 2 * (ch), 1, 2 * (ch), ch, TWL_RATE, 1 }
+#define kFormatMAT              'mtb+'          /* tvOS sets 'mtb+' or 'mtc+' (it prefers 'mtc+' when the device lists it) */
 static struct pformat formats[8];
+static SInt32 hog_pid = -1;
 static unsigned format_count, current;
 
 static AudioServerPlugInHostRef host;
@@ -197,7 +205,7 @@ format_desc(const struct pformat *f)
 {
 	return (AudioStreamBasicDescription) {
 		       .mSampleRate = TWL_RATE, .mFormatID = f->id, .mFormatFlags = f->flags,
-		       .mBytesPerPacket = 2 * f->channels, .mFramesPerPacket = 1, .mBytesPerFrame = 2 * f->channels,
+		       .mBytesPerPacket = f->bytes_per_packet, .mFramesPerPacket = f->frames_per_packet, .mBytesPerFrame = f->bytes_per_frame,
 		       .mChannelsPerFrame = f->channels, .mBitsPerChannel = 16,
 	};
 }
@@ -208,7 +216,7 @@ make_formats(void)
 {
 	struct twl_audio_caps caps;
 	unsigned max_pcm = 2;
-	Boolean ac3 = false;
+	Boolean ac3 = false, mat = false;
 
 	memset(&caps, 0, sizeof(caps));
 	if (sink >= 0 && ioctl(sink, TWL_AUDIO_GET_CAPS, &caps) == 0) {
@@ -219,24 +227,37 @@ make_formats(void)
 			if (caps.sad[i].format == 2 && (caps.sad[i].rates & 4)) {
 				ac3 = true;
 			}
+			if (caps.sad[i].format == 12 && caps.sad[i].channels >= 8) {
+				mat = true;
+			}
 		}
-		say("twilight: audio: the sink takes up to %u channels of LPCM%s (%u descriptors, speakers %#x)\n", max_pcm,
-		    ac3 ? ", AC-3" : "", caps.count, caps.speakers);
+		say("twilight: audio: the sink takes up to %u channels of LPCM%s%s (%u descriptors, speakers %#x)\n", max_pcm,
+		    ac3 ? ", AC-3" : "", mat ? ", MAT" : "", caps.count, caps.speakers);
 	} else {
 		say("twilight: audio: no capabilities from the kernel: stereo only\n");
 	}
 	format_count = 0;
-	formats[format_count++] = (struct pformat) { kAudioFormatLinearPCM, pcm_flags, 2, TWL_AUDIO_PCM };
-	if (max_pcm >= 6) {
-		formats[format_count++] = (struct pformat) { kAudioFormatLinearPCM, pcm_flags, 6, TWL_AUDIO_PCM };
+	{
+		struct pformat f2 = PCM_FORMAT(2), f6 = PCM_FORMAT(6), f8 = PCM_FORMAT(8);
+
+		formats[format_count++] = f2;
+		if (max_pcm >= 6) {
+			formats[format_count++] = f6;
+		}
+		if (max_pcm >= 8) {
+			formats[format_count++] = f8;
+		}
 	}
-	if (max_pcm >= 8) {
-		formats[format_count++] = (struct pformat) { kAudioFormatLinearPCM, pcm_flags, 8, TWL_AUDIO_PCM };
-	}
-#ifdef TWL_PASSTHROUGH
+#ifndef TWL_NO_PASSTHROUGH
 	if (ac3) {
-		/* the non-mixable format a client takes the device with to send it AC-3: Dolby Digital (tvOS "Change Format") */
-		formats[format_count++] = (struct pformat) { kFormat60958AC3, pcm_flags | kFlagNonMixable, 2, TWL_AUDIO_IEC61937 };
+		/* Dolby Digital 5.1: tvOS's own encoder, IEC 60958 framing: 'cac3', non-mixable, 48 kHz only */
+		formats[format_count++] = (struct pformat) { kFormat60958AC3, pcm_flags | kFlagNonMixable, 2, TWL_AUDIO_IEC61937,
+			                                     6144, 1536, 4, 2, TWL_RATE, 1 };
+	}
+	if (mat) {
+		/* Dolby Atmos: MAT as 32 channels of 16 bit at 48 kHz, which is the HBR stream (8 channels at 192 kHz) in the same bytes */
+		formats[format_count++] = (struct pformat) { kFormatMAT, pcm_flags | kFlagNonMixable, 32, TWL_AUDIO_HBR,
+			                                     61440, 960, 64, 8, 192000, 4 };
 	}
 #endif
 	current = 0;
@@ -290,6 +311,7 @@ struct value {
 		AudioValueRange range;
 		AudioStreamBasicDescription format;
 		AudioStreamRangedDescription ranged[8];
+		uint8_t raw[12 + 20 * 8];       /* an AudioChannelLayout of up to 8 descriptions */
 	} u;
 };
 
@@ -342,6 +364,8 @@ property(AudioObjectID object, const AudioObjectPropertyAddress *address)
 		case kAudioPlugInPropertyTranslateUIDToBox: WORD(0); break;
 		case kAudioPlugInPropertyTranslateUIDToDevice: WORD(0); break;       /* (filled in by get_property_data) */
 		case kAudioPlugInPropertyResourceBundle: STRING(CFSTR("")); break;
+		case 'clk#': v.empty = true; break;             /* no clock devices */
+		case 'cust': v.empty = true; break;             /* no custom properties */
 		}
 	} else if (object == OBJECT_DEVICE) {
 		switch (selector) {
@@ -375,6 +399,34 @@ property(AudioObjectID object, const AudioObjectPropertyAddress *address)
 			v.u.range.mMinimum = v.u.range.mMaximum = TWL_RATE; v.size = sizeof(AudioValueRange); break;
 		case kAudioDevicePropertyPreferredChannelsForStereo: v.u.words[0] = 1; v.u.words[1] = 2; v.size = 2 * sizeof(UInt32); break;
 		case kAudioDevicePropertyZeroTimeStampPeriod: WORD(TIMESTAMP_PERIOD); break;
+		case 'cust': v.empty = true; break;
+		case 'cfsz': WORD(512); break;                  /* kAudioDevicePropertyCalculateBufferFrameSize: (the qualifier's, below) */
+		case 'oink': WORD((UInt32)hog_pid); break;      /* kAudioDevicePropertyHogMode: who has the device to itself, -1 nobody */
+		case 'srnd': {                                  /* kAudioDevicePropertyPreferredChannelLayout: in the order of the HDMI slots (CTA-861 CA 0x0b, 0x13) */
+			static const UInt32 labels[8] = { 1 /* L */, 2 /* R */, 4 /* LFE */, 3 /* C */, 5 /* Ls */, 6 /* Rs */, 33 /* Lrs */, 34 /* Rrs */ };
+			UInt32 n = formats[current].kind == TWL_AUDIO_PCM ? formats[current].channels : 2, *w = (UInt32 *)v.u.raw;
+
+			if (scope != kAudioObjectPropertyScopeOutput) {
+				break;
+			}
+			if (n == 2) {
+				w[0] = (101u << 16) | 2;                /* kAudioChannelLayoutTag_Stereo */
+				w[1] = 0;
+				w[2] = 0;
+				v.size = 12;
+			} else {
+				w[0] = 0;                               /* kAudioChannelLayoutTag_UseChannelDescriptions */
+				w[1] = 0;
+				w[2] = n;
+				for (UInt32 c = 0; c < n; c++) {
+					w[3 + 5 * c] = labels[c];       /* label, flags 0, coordinates 0 */
+					w[4 + 5 * c] = 0;
+					w[5 + 5 * c] = w[6 + 5 * c] = w[7 + 5 * c] = 0;
+				}
+				v.size = 12 + 20 * n;
+			}
+			break;
+		}
 		}
 	} else {
 		switch (selector) {
@@ -437,7 +489,7 @@ is_property_settable(AudioServerPlugInDriverRef driver, AudioObjectID object, pi
 		*settable = address->mSelector == kAudioStreamPropertyIsActive || address->mSelector == kAudioStreamPropertyVirtualFormat ||
 		    address->mSelector == kAudioStreamPropertyPhysicalFormat;
 	} else {
-		*settable = object == OBJECT_DEVICE && address->mSelector == kAudioDevicePropertyNominalSampleRate;
+		*settable = object == OBJECT_DEVICE && (address->mSelector == kAudioDevicePropertyNominalSampleRate || address->mSelector == 'oink');
 	}
 	return 0;
 }
@@ -479,6 +531,11 @@ get_property_data(AudioServerPlugInDriverRef driver, AudioObjectID object, pid_t
 	}
 	pthread_mutex_lock(&lock);
 	v = property(object, address);
+	if (address->mSelector == 'cfsz' && qsize == sizeof(UInt32) && qualifier != NULL) {
+		UInt32 want = *(const UInt32 *)qualifier;
+
+		v.u.words[0] = want < 32 ? 32 : want > TIMESTAMP_PERIOD ? TIMESTAMP_PERIOD : want;
+	}
 	if (object == OBJECT_PLUGIN && address->mSelector == kAudioPlugInPropertyTranslateUIDToDevice && qsize == sizeof(CFStringRef) &&
 	    qualifier != NULL && *(const CFStringRef *)qualifier != NULL && CFEqual(*(const CFStringRef *)qualifier, CFSTR(TWL_DEVICE_UID))) {
 		v.u.words[0] = OBJECT_DEVICE;
@@ -486,7 +543,7 @@ get_property_data(AudioServerPlugInDriverRef driver, AudioObjectID object, pid_t
 	pthread_mutex_unlock(&lock);
 	if (v.size > room) {
 		if (address->mSelector != kAudioObjectPropertyOwnedObjects && address->mSelector != kAudioDevicePropertyStreams &&
-		    address->mSelector != kAudioPlugInPropertyDeviceList && address->mSelector != kAudioStreamPropertyAvailablePhysicalFormats &&
+		    address->mSelector != kAudioPlugInPropertyDeviceList && address->mSelector != 'srnd' && address->mSelector != kAudioStreamPropertyAvailablePhysicalFormats &&
 		    address->mSelector != kAudioStreamPropertyAvailableVirtualFormats) {
 			return kAudioHardwareBadPropertySizeError;
 		}
@@ -504,7 +561,7 @@ get_property_data(AudioServerPlugInDriverRef driver, AudioObjectID object, pid_t
 static void
 kernel_format(void)
 {
-	struct twl_audio_format f = { formats[current].kind, TWL_RATE, formats[current].channels, 16 };
+	struct twl_audio_format f = { formats[current].kind, formats[current].hw_rate, formats[current].hw_channels, 16 };
 
 	if (sink >= 0 && ioctl(sink, TWL_AUDIO_SET_FORMAT, &f) < 0) {
 		say("twilight: audio: the kernel would not take %u channels, kind %u (%s)\n", f.channels, f.kind, strerror(errno));
@@ -561,6 +618,16 @@ set_property_data(AudioServerPlugInDriverRef driver, AudioObjectID object, pid_t
 		inactive = size == sizeof(UInt32) && *(const UInt32 *)data == 0;
 		return 0;
 	}
+	if (address->mSelector == 'oink') {
+		if (size != sizeof(SInt32)) {
+			return kAudioHardwareBadPropertySizeError;
+		}
+		pthread_mutex_lock(&lock);
+		hog_pid = *(const SInt32 *)data;
+		pthread_mutex_unlock(&lock);
+		say("twilight: audio: hog mode %d\n", (int)hog_pid);
+		return 0;
+	}
 	if (address->mSelector == kAudioDevicePropertyNominalSampleRate) {
 		return size == sizeof(Float64) && *(const Float64 *)data == TWL_RATE ? 0 : kAudioDeviceUnsupportedFormatError;
 	}
@@ -576,7 +643,12 @@ set_property_data(AudioServerPlugInDriverRef driver, AudioObjectID object, pid_t
 		for (unsigned i = 0; i < format_count; i++) {
 			if (w->mFormatID == formats[i].id && w->mChannelsPerFrame == formats[i].channels && w->mSampleRate == TWL_RATE &&
 			    w->mBitsPerChannel == 16) {
+				AudioObjectPropertyAddress layout = { 'srnd', kAudioObjectPropertyScopeOutput, 0 };
+
 				current = i;
+				if (host != NULL) {
+					host->PropertiesChanged(host, OBJECT_DEVICE, 1, &layout);
+				}
 				if (running) {
 					kernel_format();
 				}
@@ -642,10 +714,10 @@ get_zero_time_stamp(__unused AudioServerPlugInDriverRef driver, AudioObjectID ob
 	}
 	pthread_mutex_lock(&lock);
 	if (have_position && sink >= 0 && ioctl(sink, TWL_AUDIO_GET_POSITION, &pos) == 0 && pos.running) {
-		UInt64 whole = pos.frames / TIMESTAMP_PERIOD;
+		UInt64 hal_frames = pos.frames / formats[current].rate_div, whole = hal_frames / TIMESTAMP_PERIOD;
 
 		*sample_time = (Float64)(whole * TIMESTAMP_PERIOD);
-		*host_time = pos.mach_time - (UInt64)((Float64)(pos.frames - whole * TIMESTAMP_PERIOD) * ticks_per_frame);
+		*host_time = pos.mach_time - (UInt64)((Float64)(hal_frames - whole * TIMESTAMP_PERIOD) * ticks_per_frame);
 		*seed = 1;
 		pthread_mutex_unlock(&lock);
 		return 0;
@@ -685,7 +757,7 @@ do_io_operation(__unused AudioServerPlugInDriverRef driver, __unused AudioObject
 	}
 	if (operation == kAudioServerPlugInIOOperationWriteMix) {
 		/* the kernel takes what fits (it never makes this thread wait) */
-		if (sink < 0 || write(sink, buffer, (size_t)frames * 2 * formats[current].channels) < 0) {
+		if (sink < 0 || write(sink, buffer, (size_t)frames * formats[current].bytes_per_frame) < 0) {
 			refused += frames;
 		}
 		written += frames;
