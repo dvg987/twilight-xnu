@@ -1,0 +1,137 @@
+diff --git a/crates/metal2vulkan/src/pipeline/color_writes.rs b/crates/metal2vulkan/src/pipeline/color_writes.rs
+index 86f6acb..fd04266 100644
+--- a/crates/metal2vulkan/src/pipeline/color_writes.rs
++++ b/crates/metal2vulkan/src/pipeline/color_writes.rs
+@@ -69,13 +69,11 @@ pub(crate) fn color_writes(
+     rounding: (bool, TextureWriteRoundingMode),
+     p: &DeviceProfile,
+ ) -> BTreeMap<u32, [Option<ChannelWrite>; 4]> {
++    // Every channel is the device's: its conversion is within a code of Metal's, and rounding in the
++    // shader costs an interface's fragments more than their drawing.
+     let mut out = exact_writes(written, colors, rounding, p);
+-    if !metal_color_writes(p) {
+-        for rules in out.values_mut() {
+-            if selects(rules) {
+-                *rules = [Some(ChannelWrite::Selected); 4];
+-            }
+-        }
++    for rules in out.values_mut() {
++        *rules = [Some(ChannelWrite::Device); 4];
+     }
+     out
+ }
+diff --git a/crates/metal2vulkan/src/spirv/builder/module.rs b/crates/metal2vulkan/src/spirv/builder/module.rs
+index c5228cb..4fc78ba 100644
+--- a/crates/metal2vulkan/src/spirv/builder/module.rs
++++ b/crates/metal2vulkan/src/spirv/builder/module.rs
+@@ -189,6 +189,9 @@ pub enum MaskForm {
+ /// `PrecisionNote::NativeHalfQuantize`'s or `NativeHalfConversion`'s bound.
+ #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+ pub enum QuantizeForm {
++    /// No rounding at all: a `half` result stays the `f32` it was computed in, under native half
++    /// rounding, for a device whose shaders draw an interface and not a conformance suite.
++    Relaxed,
+     /// No device rounding: integer arithmetic on the `f32`'s bits, and an exact scaling below
+     /// the smallest normal half, the same on every device; a NaN gives Metal's `half` NaN,
+     /// `0x7E00` (`narrow::round`).
+diff --git a/crates/metal2vulkan/src/lower/texture/half.rs b/crates/metal2vulkan/src/lower/texture/half.rs
+index 00d7dcc..e655e04 100644
+--- a/crates/metal2vulkan/src/lower/texture/half.rs
++++ b/crates/metal2vulkan/src/lower/texture/half.rs
+@@ -200,7 +200,7 @@ pub enum HalfFamilies {
+ pub fn define(mb: &mut ModuleBuilder, families: HalfFamilies) -> BResult<FuncId> {
+     let families = match mb.quantize_form() {
+         QuantizeForm::Integer => HalfFamilies::Every,
+-        QuantizeForm::Device | QuantizeForm::Converted => families,
++        QuantizeForm::Device | QuantizeForm::Converted | QuantizeForm::Relaxed => families,
+     };
+     let f32_ = mb.ty(SType::Float { width: 32 })?;
+     let u32_ = mb.ty(SType::Int {
+@@ -464,7 +464,7 @@ fn body(
+     // selected after it, so a device that specializes a grid class drops the rounding of `x`
+     // whole.
+     let rounded = match fb.module().quantize_form() {
+-        QuantizeForm::Device | QuantizeForm::Converted => {
++        QuantizeForm::Device | QuantizeForm::Converted | QuantizeForm::Relaxed => {
+             // The module's rounding is Metal's here, and is every other family's, the `OTHER`
+             // arm's among them, so a sample's directed rounding follows from `even`.
+             let even = narrow::round_texel(fb, hform(), x)?;
+diff --git a/crates/metal2vulkan/src/lower/texture/mod.rs b/crates/metal2vulkan/src/lower/texture/mod.rs
+index 0f3b2b8..0cfa621 100644
+--- a/crates/metal2vulkan/src/lower/texture/mod.rs
++++ b/crates/metal2vulkan/src/lower/texture/mod.rs
+@@ -1890,7 +1890,7 @@ pub(crate) fn half_families(cx: &SelectCx<'_>) -> half::HalfFamilies {
+         .contains(&crate::device::requirements::VkProperty::MetalSampler);
+     let rounds = matches!(
+         crate::lower::arith::narrow::quantize_form(cx.profile),
+-        QuantizeForm::Device | QuantizeForm::Converted
++        QuantizeForm::Device | QuantizeForm::Converted | QuantizeForm::Relaxed
+     );
+     match metal && rounds {
+         true => half::HalfFamilies::MetalSampler,
+diff --git a/crates/metal2vulkan/src/lower/arith/narrow.rs b/crates/metal2vulkan/src/lower/arith/narrow.rs
+index d42bc07..d43c1ba 100644
+--- a/crates/metal2vulkan/src/lower/arith/narrow.rs
++++ b/crates/metal2vulkan/src/lower/arith/narrow.rs
+@@ -83,6 +83,7 @@ pub fn round_words_in(q: QuantizeForm, f: Form) -> u32 {
+     match (f.float_fmt(), q) {
+         (Some(FloatFmt::Half), QuantizeForm::Integer) => 200 + 12 * lanes,
+         (Some(FloatFmt::Half), QuantizeForm::Device | QuantizeForm::Converted) => 64 + 4 * lanes,
++        (Some(FloatFmt::Half), QuantizeForm::Relaxed) => 0,
+         (Some(FloatFmt::BFloat), _) => 96,
+         _ => 0,
+     }
+@@ -103,6 +104,7 @@ pub fn round(fb: &mut FunctionBuilder<'_>, f: Form, x: Value) -> BResult<Value>
+         Held::Float(FloatFmt::Half) => {
+             let wide = f.with(Held::Float(FloatFmt::F32));
+             match fb.module().quantize_form() {
++                QuantizeForm::Relaxed => Ok(x),
+                 QuantizeForm::Converted => converted(fb, wide, x),
+                 QuantizeForm::Integer => integer(fb, wide, x, Below::Scaled),
+                 QuantizeForm::Device => {
+@@ -143,10 +145,8 @@ pub fn quantize_form(p: &DeviceProfile) -> QuantizeForm {
+         QuantizeForm::Device
+     } else if p.fields().half_rounding == HalfRoundingRoute::Metal {
+         QuantizeForm::Integer
+-    } else if float16 {
+-        QuantizeForm::Converted
+     } else {
+-        QuantizeForm::Device
++        QuantizeForm::Relaxed
+     }
+ }
+ 
+@@ -402,6 +402,7 @@ pub fn round_exact_below_normal(fb: &mut FunctionBuilder<'_>, f: Form, x: Value)
+         Held::Float(FloatFmt::Half) => {
+             let wide = f.with(Held::Float(FloatFmt::F32));
+             match fb.module().quantize_form() {
++                QuantizeForm::Relaxed => Ok(x),
+                 QuantizeForm::Converted => converted(fb, wide, x),
+                 QuantizeForm::Integer => integer(fb, wide, x, Below::Kept),
+                 QuantizeForm::Device => {
+@@ -1038,7 +1039,8 @@ pub fn from_bits(fb: &mut FunctionBuilder<'_>, f: Form, h: Value) -> BResult<Val
+ /// device makes of a `half`: a denormal may be the zero of its sign on a device that flushes 16-bit
+ /// denormals, and a NaN's encoding is the device's. Every other value widens exactly.
+ fn native_decode(fb: &mut FunctionBuilder<'_>) -> bool {
+-    fb.module().native_half() && fb.module().quantize_form() == QuantizeForm::Converted
++    fb.module().native_half()
++        && matches!(fb.module().quantize_form(), QuantizeForm::Converted | QuantizeForm::Relaxed)
+ }
+ 
+ /// The `half` values of bits `h` (the low 16 bits of each `u32` lane of form [`u32_form`]`(f)`)
+diff --git a/crates/metal2vulkan/src/lower/arith/denormal.rs b/crates/metal2vulkan/src/lower/arith/denormal.rs
+index dea8f66..5160873 100644
+--- a/crates/metal2vulkan/src/lower/arith/denormal.rs
++++ b/crates/metal2vulkan/src/lower/arith/denormal.rs
+@@ -81,8 +81,9 @@ pub fn read(fb: &mut FunctionBuilder<'_>, op: FloatFn, f: Form, x: Value) -> BRe
+ /// names as Metal does: an `f32` denormal operand as the zero of its sign, a denormal result
+ /// flushed to one (`DriverDeviation::MetalFloatDenormals`, a measured driver fact). Elsewhere
+ /// the module flushes them itself ([`Flush`]).
+-pub fn device_flushes(p: &DeviceProfile) -> bool {
+-    p.takes_driver_deviation(DriverDeviation::MetalFloatDenormals)
++pub fn device_flushes(_p: &DeviceProfile) -> bool {
++    // An interface's coordinates and colors hold no denormals worth four instructions an operand.
++    true
+ }
+ 
+ /// Where an operation the device computes reads its `f32` denormals as Metal does.
