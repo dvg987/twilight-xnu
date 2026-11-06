@@ -7,9 +7,11 @@
 #include <mach/mach.h>
 #include <mach-o/dyld.h>
 #include <stdarg.h>
+#include <libkern/OSCacheControl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/sysctl.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -54,6 +56,70 @@ replace_virtual(const char *what, uintptr_t slot, uintptr_t expected, void *repl
 	*entry = (uintptr_t)replacement;
 	vm_protect(mach_task_self(), page, vm_page_size, FALSE, VM_PROT_READ);
 	return original;
+}
+
+/*
+ * new_metal_context sets MetalContext flag 0x800 (framebuffer fetch) without asking the device. Boot-arg ca_fetch=0 clears it, for
+ * measurements only: CA then never draws the textures its backdrop blurs read, and they show as unwritten (magenta).
+ */
+static void
+fetch_off(void)
+{
+	static const char key[] = "ca_fetch=0";
+	char args[1024] = "";
+	size_t length = sizeof(args) - 1;
+	uint32_t *insn = (uint32_t *)(0x189afd240UL + slide);
+	vm_address_t page = (vm_address_t)insn & ~(vm_address_t)(vm_page_size - 1);
+
+	if (sysctlbyname("kern.bootargs", args, &length, NULL, 0) != 0 || strstr(args, key) == NULL) {
+		return;
+	}
+	if (*insn != 0x52850009) {      /* mov w9, #0x2800 */
+		say("twl: new_metal_context: found %#x; framebuffer fetch left on\n", *insn);
+		return;
+	}
+	if (vm_protect(mach_task_self(), page, vm_page_size, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) != KERN_SUCCESS) {
+		say("twl: new_metal_context: text not writable\n");
+		return;
+	}
+	*insn = 0x52840009;             /* mov w9, #0x2000 */
+	vm_protect(mach_task_self(), page, vm_page_size, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+	sys_icache_invalidate(insn, sizeof(*insn));
+	say("twl: framebuffer fetch off\n");
+}
+
+/*
+ * fb_flip=1: the display scans the surface a frame was drawn in, so IOMFBDisplay::finish_update's copy of it to the surface the swap names (the
+ * M2 scaler's job, a full-screen pass of the GPU here) is for nothing: both its calls of copy_surface answer "done" instead.
+ */
+static void
+scanout_copy_off(void)
+{
+	static const uintptr_t calls[] = { 0x189be6da4UL, 0x189be7734UL };
+	char args[1024] = "";
+	size_t length = sizeof(args) - 1;
+
+	if (sysctlbyname("kern.bootargs", args, &length, NULL, 0) != 0 || strstr(args, "fb_flip=1") == NULL) {
+		return;
+	}
+	for (unsigned i = 0; i < sizeof(calls) / sizeof(calls[0]); i++) {
+		uint32_t *insn = (uint32_t *)(calls[i] + slide);
+		uint32_t bl = 0x94000000u | (uint32_t)(((0x189bf6ef8UL - calls[i]) >> 2) & 0x3ffffff);
+		vm_address_t page = (vm_address_t)insn & ~(vm_address_t)(vm_page_size - 1);
+
+		if (*insn != bl) {
+			say("twl: finish_update: found %#x at %#lx, expected %#x; copy left on\n", *insn, calls[i], bl);
+			continue;
+		}
+		if (vm_protect(mach_task_self(), page, vm_page_size, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) != KERN_SUCCESS) {
+			say("twl: finish_update: text not writable\n");
+			continue;
+		}
+		*insn = 0x52800020;             /* mov w0, #1 */
+		vm_protect(mach_task_self(), page, vm_page_size, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+		sys_icache_invalidate(insn, sizeof(*insn));
+		say("twl: finish_update: copy %u to the scanout surface off\n", i);
+	}
 }
 
 #define VSLOT(vtable, offset)   ((vtable) + 0x10 + (offset))
@@ -105,12 +171,49 @@ static uintptr_t (*render_update_o)(void *, void *, unsigned *);
 static void *(*renderer_o)(void *);
 static uintptr_t (*render_surface_o)(void *, void *, void *, void *, int);
 static unsigned n_render, n_surface, n_renderer;
+static uint64_t pace_wait, pace_copy;  /* this window's time in copy_refs, ns */
+
+/*
+ * Frame pacing: every 60 frames that follow another within 250 ms (something is moving), how far apart they were and where the
+ * time went: render_update in all, and of that the wait for the GPU and the copies.
+ */
+static void
+pace(uint64_t start, uint64_t end)
+{
+	static const unsigned edge[] = { 20, 36, 53, 70, 105, 250 };
+	static uint64_t last, render, gaps;
+	static unsigned bucket[6], frames;
+	uint64_t gap = (start - last) / 1000000;
+
+	last = start;
+	if (gap >= 250) {
+		pace_wait = pace_copy = 0;
+		return;
+	}
+	for (int i = 0; i < 6; i++) {
+		if (gap < edge[i]) {
+			bucket[i]++;
+			break;
+		}
+	}
+	gaps += gap;
+	render += end - start;
+	if (++frames == 60) {
+		say("twl: pace n=60 gap %llu ms <20:%u <36:%u <53:%u <70:%u <105:%u <250:%u render %llu us wait %llu us copy %llu us\n", gaps / 60,
+		    bucket[0], bucket[1], bucket[2], bucket[3], bucket[4], bucket[5], render / 60000, pace_wait / 60000, pace_copy / 60000);
+		memset(bucket, 0, sizeof(bucket));
+		frames = 0;
+		gaps = render = pace_wait = pace_copy = 0;
+	}
+}
 
 static uintptr_t
 my_render_update(void *server, void *update, unsigned *flags)
 {
+	uint64_t start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
 	uintptr_t r = render_update_o(server, update, flags);
 
+	pace(start, clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
 	if (n_render++ % 200 == 0 || n_render < 8) {
 		say("twl: Server::render_update -> %#lx flags %#x (call %u)\n", r, flags ? *flags : 0, n_render);
 	}
@@ -210,15 +313,36 @@ wait_for_gpu(void)
 	}
 }
 
+static int (*flip_wait)(uint32_t);
+
+/* What the processor wrote, out to memory: with fb_flip the display reads the surface, and nothing else may clean it. */
+static void
+clean_to_memory(char *start, size_t length)
+{
+	uint64_t ctr;
+	size_t line;
+
+	__asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
+	line = 4u << ((ctr >> 16) & 0xf);
+	for (uintptr_t p = (uintptr_t)start & ~(uintptr_t)(line - 1); p < (uintptr_t)start + length; p += line) {
+		__asm__ volatile("dc cvac, %0" : : "r"(p) : "memory");
+	}
+	__asm__ volatile("dsb sy" : : : "memory");
+}
+
 static void
 copy_refs(IOSurfaceRef src, IOSurfaceRef dst)
 {
+	static uint64_t waited, copied;
+	uint64_t t0, t1, t2;
 	size_t rows, bytes;
 
 	if (IOSurfaceGetWidth(src) != IOSurfaceGetWidth(dst) || IOSurfaceGetHeight(src) != IOSurfaceGetHeight(dst)) {
 		return;
 	}
+	t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
 	wait_for_gpu();
+	t1 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
 	IOSurfaceLock(src, 1 /* read only */, NULL);
 	IOSurfaceLock(dst, 0, NULL);
 	rows = IOSurfaceGetHeight(src);
@@ -227,10 +351,19 @@ copy_refs(IOSurfaceRef src, IOSurfaceRef dst)
 		memcpy((char *)IOSurfaceGetBaseAddress(dst) + y * IOSurfaceGetBytesPerRow(dst),
 		    (const char *)IOSurfaceGetBaseAddress(src) + y * IOSurfaceGetBytesPerRow(src), bytes);
 	}
+	if (flip_wait != NULL) {
+		clean_to_memory(IOSurfaceGetBaseAddress(dst), rows * IOSurfaceGetBytesPerRow(dst));
+	}
 	IOSurfaceUnlock(dst, 0, NULL);
 	IOSurfaceUnlock(src, 1, NULL);
+	t2 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+	waited += t1 - t0;
+	copied += t2 - t1;
+	pace_wait += t1 - t0;
+	pace_copy += t2 - t1;
 	if (copies++ < 8 || copies % 100 == 0) {
-		say("twl: copy surface %u -> %u (%zu rows, copy %u)\n", IOSurfaceGetID(src), IOSurfaceGetID(dst), rows, copies);
+		say("twl: copy surface %u -> %u (%zu rows, copy %u, mean wait %llu us, copy %llu us)\n", IOSurfaceGetID(src), IOSurfaceGetID(dst), rows,
+		    copies, waited / copies / 1000, copied / copies / 1000);
 	}
 }
 
@@ -278,12 +411,66 @@ is_drawn_into(uint32_t id)
 	return 0;
 }
 
+static uint64_t (*commits)(void);
+static int (*flip)(uint32_t), (*flip_target)(uint32_t);
+static uint64_t flip_commits;
+static int flip_pending;
+static void *copy_from, *copy_to;
+
 static void
 transfer_to_scanout(void)
 {
+	static int (*set_source)(IOSurfaceRef, uint64_t);
+	static int looked;
 	IOSurfaceRef src = last_surface ? surface_ref(last_surface) : NULL;
 
 	if (src == NULL) {
+		return;
+	}
+	if (!looked) {
+		char args[1024] = "";
+		size_t length = sizeof(args) - 1;
+
+		looked = 1;
+		if (sysctlbyname("kern.bootargs", args, &length, NULL, 0) == 0) {
+			if (strstr(args, "twl_source=1") != NULL) {
+				set_source = (int (*)(IOSurfaceRef, uint64_t))dlsym(RTLD_DEFAULT, "native_gop_set_source");
+			}
+			if (strstr(args, "fb_flip=1") != NULL) {
+				flip = (int (*)(uint32_t))dlsym(RTLD_DEFAULT, "native_gop_flip");
+				flip_target = (int (*)(uint32_t))dlsym(RTLD_DEFAULT, "native_gop_flip_target");
+				flip_wait = (int (*)(uint32_t))dlsym(RTLD_DEFAULT, "native_gop_flip_wait");
+				commits = (uint64_t (*)(void))dlsym(RTLD_DEFAULT, "native_bridge_metal_commits");
+				say("twl: fb_flip=1: native_gop_flip at %p\n", (void *)flip);
+			}
+		}
+	}
+	/*
+	 * The display scans the surface it was drawn in; the swap's surfaces stay as they are. The drawing is committed after this: the plug-in
+	 * flips when it completes. A frame that commits nothing is flipped by my_update_surface.
+	 */
+	if (copy_to != NULL && flip_target != NULL) {
+		uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+
+		/* the frame before is on the display by now, and the surface it replaced free: nothing of this frame is committed yet */
+		wait_for_gpu();
+		if (surface_ref(copy_to) != NULL) {
+			flip_wait(IOSurfaceGetID(surface_ref(copy_to)));
+		}
+		pace_wait += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
+		copy_back(copy_from, copy_to);
+		copy_to = NULL;
+	}
+	if (flip_target != NULL && flip_target(IOSurfaceGetID(src))) {
+		flip_pending = 1;
+		flip_commits = commits != NULL ? commits() : 0;
+		return;
+	}
+	/*
+	 * twl_source=1, for measurements: the display's presenter copies the frame from here itself. The surfaces the swap names then go
+	 * stale, and the kernel's settle and any frame the presenter misses draw whatever they last held.
+	 */
+	if (set_source != NULL && set_source(src, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000)) {
 		return;
 	}
 	for (uint32_t id = 1; id <= 8; id++) {
@@ -306,7 +493,17 @@ my_update_surface(void *display, int a, int b, uint64_t c, int d)
 	void *r = update_surface_o(display, a, b, c, d);
 
 	if (r != NULL && last_surface != NULL && r != last_surface) {
-		copy_back(last_surface, r);
+		if (flip_wait != NULL) {
+			/* the surface may be on the display: copied at the hand-over, when it has left. A frame that committed nothing is flipped here. */
+			if (flip_pending && commits != NULL && commits() == flip_commits && surface_ref(last_surface) != NULL) {
+				flip(IOSurfaceGetID(surface_ref(last_surface)));
+			}
+			flip_pending = 0;
+			copy_from = last_surface;
+			copy_to = r;
+		} else {
+			copy_back(last_surface, r);
+		}
 	}
 	if (r != NULL) {
 		IOSurfaceRef ref = surface_ref(r);
@@ -416,6 +613,8 @@ twl_init(void)
 	base = (uintptr_t)_dyld_get_shared_cache_range(&length);
 	slide = base - 0x180000000UL;
 	say("twl: in %s, shared cache slide %#lx\n", path, slide);
+	fetch_off();
+	scanout_copy_off();
 	AppleDisplay_install(0x1cf195240UL);
 	AppleCLCDDisplay_install(0x1cf196a20UL);
 	AppleRGBOutDisplay_install(0x1cf195a60UL);

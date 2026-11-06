@@ -136,4 +136,4 @@ python3 hakios/tools/apfs/mkapfs.py -z -o $O/root.apfs redwood=$O/root | tail -1
 python3 hakios/tools/apfs/mkapfs.py -o $O/boot.apfs Boot=$O/boot | tail -1
 python3 hakios/xnuloader/mkpayload.py -o out/payload-tvos.bin kernel=hakios/hakios-kernel \
 	ramdisk=$O/boot.apfs ramdisk1=$O/root.apfs --no-version \
-	--cmdline "cpus=3 emmc=1 root_apfs=emmc_darwin loader_return_after=${SECS:-180} epoch=$(date +%s) twl_hang=${HANG:-90} $ARGS"
+	--cmdline "cpus=${CPUS:-3} emmc=1 root_apfs=emmc_darwin loader_return_after=${SECS:-180} epoch=$(date +%s) twl_hang=${HANG:-90} $ARGS"

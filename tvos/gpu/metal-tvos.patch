@@ -1,5 +1,5 @@
 diff --git a/metal-plugin/NativeMaliMetalPlugin.mm b/metal-plugin/NativeMaliMetalPlugin.mm
-index ec81e63..c394264 100644
+index ec81e63..1d55518 100644
 --- a/metal-plugin/NativeMaliMetalPlugin.mm
 +++ b/metal-plugin/NativeMaliMetalPlugin.mm
 @@ -6,6 +6,9 @@
@@ -119,7 +119,18 @@ index ec81e63..c394264 100644
      // Which of the posters is the one on the lock screen depends on the Data volume (a fresh one picks the collections / photos posters, an older
      // one the Aegir and Kaleidoscope ones), so every poster extension of the system gets a device; the idle ones never ask for it.
      static const char *const names[] = {
-@@ -1372,6 +1427,8 @@ void *presenterThread(void *argument) {
+@@ -1349,6 +1404,10 @@ bool clientProcess() {
+ // and this thread ends; while this thread is not waiting the display driver copies with the CPU, as before.
+ constexpr int kIOReturnTimeoutCode = (int)0xe00002d6;   // kIOReturnTimeout: nothing was offered in the time given (an idle display)
+ 
++extern "C" void native_gop_alive(void);
++extern "C" IOSurfaceRef native_gop_copy_source(uint64_t *committedUs);
++extern "C" void native_bridge_metal_wait_committed(uint64_t beforeUs);
++
+ void *presenterThread(void *argument) {
+     id<MTLDevice> device = (id<MTLDevice>)CFBridgingRelease(argument);
+     IOKit &k = iokit();
+@@ -1372,6 +1431,8 @@ void *presenterThread(void *argument) {
          r = k.call(connection, MALI_GOP, &in, sizeof in, &out, &outSize);
          if (r == 0)
              break;
@@ -128,7 +139,48 @@ index ec81e63..c394264 100644
          sleep(2);
      }
      if (r != 0) {
-@@ -1523,6 +1580,10 @@ id openDevice(unsigned port) {
+@@ -1401,9 +1462,11 @@ void *presenterThread(void *argument) {
+     typedef size_t (*TimingFn)(char *, size_t);
+     TimingFn timing = gIcdHandle ? reinterpret_cast<TimingFn>(dlsym(gIcdHandle, "drm_darwin_timing")) : nullptr;
+     for (unsigned errors = 0; errors < 50;) {
++        native_gop_alive();
+         in = {MALI_GOP_WAIT, 0, 100};
+         outSize = sizeof out;
+         r = k.call(connection, MALI_GOP, &in, sizeof in, &out, &outSize);
++        native_gop_alive();
+         if (r == kIOReturnTimeoutCode)
+             continue;
+         if (r != 0) {
+@@ -1412,9 +1475,18 @@ void *presenterThread(void *argument) {
+             usleep(20000);
+             continue;
+         }
+-        const mali_gop_swap swap = out.swap;
++        mali_gop_swap swap = out.swap;
+         const uint64_t began = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+         uint32_t status = 1;
++        // The surface CoreAnimation drew stands for the one the swap names: the wait for its drawing is this thread's, not the render thread's.
++        uint64_t committedUs = 0;
++        IOSurfaceRef source = native_gop_copy_source(&committedUs);
++        if (source && IOSurfaceGetWidth(source) == swap.width && IOSurfaceGetHeight(source) == swap.height) {
++            native_bridge_metal_wait_committed(committedUs);
++            swap.address = (uint64_t)(uintptr_t)IOSurfaceGetBaseAddress(source);
++            swap.stride = IOSurfaceGetBytesPerRow(source);
++            swap.bytes = IOSurfaceGetAllocSize(source);
++        }
+         @autoreleasepool {
+             const uint64_t rowBytes = (uint64_t)swap.width * 4;
+             const uint64_t srcBytes = (swap.bytes + 0xfff) & ~0xfffull;
+@@ -1448,6 +1520,8 @@ void *presenterThread(void *argument) {
+             frame = nil;
+             releaseNs += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - r0;
+         }
++        if (source)
++            CFRelease(source);
+         const uint64_t copied = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+         copyNs += copied - began;
+         in = {MALI_GOP_COMPLETE, status, swap.sequence};
+@@ -1523,6 +1597,10 @@ id openDevice(unsigned port) {
          setenv("METAL2VULKAN_LOG_PIPELINES", "1", 0);
          CFPreferencesSetAppValue(CFSTR("CAEnableFramebufferCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
          CFPreferencesSetAppValue(CFSTR("CAEnableIOSurfaceCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
@@ -139,7 +191,7 @@ index ec81e63..c394264 100644
  
          // The runtime refuses to open without a writable shader-cache directory, and which directories the render server's sandbox lets it write is
          // not known from here: the user cache and temp directories, /tmp and /var/tmp, the first that opens a device.
-@@ -1686,9 +1747,9 @@ extern "C" __attribute__((visibility("default"))) int nmm_selftest(int quartzcor
+@@ -1686,9 +1764,9 @@ extern "C" __attribute__((visibility("default"))) int nmm_selftest(int quartzcor
      mlog("selftest: %s, cache %s, QuartzCore library %zu bytes", icd, cache, library.size());
      NmbSelftest result = {};
      const uint32_t code = nmb_selftest(icd, cache, library.empty() ? nullptr : library.data(), library.size(), selftestMark, &result);
@@ -151,6 +203,27 @@ index ec81e63..c394264 100644
      mlog("selftest: %s", result.message);
      return (int)code;
  }
+@@ -1703,3 +1781,20 @@ extern "C" __attribute__((visibility("default"))) int nmm_selftest(int quartzcor
+     return openDevice(port);
+ }
+ @end
++
++// The surface CoreAnimation drew, for the display to scan (boot-arg fb_flip=1), named by tvOS's twlhook ahead of its swap. 0: the caller copies the frame.
++// (A connection of its own: the presenter's sits in MALI_GOP_WAIT.)
++static int gopFlipCall(uint32_t op, uint32_t surface) {
++    static unsigned connection;
++    IOKit &k = iokit();
++    if (!connection && k.matching && k.getService && k.open)
++        if (const unsigned service = k.getService(0, k.matching(MALI_SERVICE)))
++            k.open(service, mach_task_self(), 0, &connection);
++    if (!connection || !k.call)
++        return 0;
++    mali_gop_in in = {op, 0, surface};
++    return k.call(connection, MALI_GOP, &in, sizeof in, nullptr, nullptr) == 0;
++}
++extern "C" __attribute__((visibility("default"))) int native_gop_flip(uint32_t surface) {return gopFlipCall(MALI_GOP_FLIP, surface);}
++// Back from this, the surface is off the display and may be drawn into.
++extern "C" __attribute__((visibility("default"))) int native_gop_flip_wait(uint32_t surface) {return gopFlipCall(MALI_GOP_FLIP_WAIT, surface);}
 diff --git a/metal-plugin/bridge/NativeMetalBridge.rs b/metal-plugin/bridge/NativeMetalBridge.rs
 index 997735f..407f6c0 100644
 --- a/metal-plugin/bridge/NativeMetalBridge.rs
@@ -234,11 +307,41 @@ index 997735f..407f6c0 100644
  fn selftest(run: &mut Run, loader: &CStr, cache: &CStr, qc: &[u8]) -> u32 {
      run.step(0x6501);
      let device = match open(loader, cache) {
+diff --git a/metal-plugin/bridge/NativeMetalObjects.rs b/metal-plugin/bridge/NativeMetalObjects.rs
+index 31967b4..f5f49cc 100644
+--- a/metal-plugin/bridge/NativeMetalObjects.rs
++++ b/metal-plugin/bridge/NativeMetalObjects.rs
+@@ -554,7 +554,7 @@ fn device_answer(device: &NmbDevice, selector: &str, arg: u64) -> Result<u64, St
+         "areProgrammableSamplePositionsSupported" => gap(p.are_programmable_sample_positions_supported())?,
+         "supports32BitFloatFiltering" => p.supports_32bit_float_filtering as u64,
+         // A Memoryless texture is a transient render attachment (texture.rs), which every device makes.
+-        "supportsMemorylessRenderTargets" => 1,
++        "supportsMemorylessRenderTargets" => 0,
+         "supportsSamplerReductionMode" => gap(p.supports_sampler_reduction_mode())?,
+         // Apple's SIMD-group functions: the family's SIMD-scoped barrier and permute rows are exact on the device.
+         "supportsSIMDGroup" => {
 diff --git a/metal-plugin/frontend/NativeBridgeMetalFrontend.mm b/metal-plugin/frontend/NativeBridgeMetalFrontend.mm
-index cde587a..2c56e3d 100644
+index cde587a..ac5b524 100644
 --- a/metal-plugin/frontend/NativeBridgeMetalFrontend.mm
 +++ b/metal-plugin/frontend/NativeBridgeMetalFrontend.mm
-@@ -796,6 +796,7 @@ static void waitForResource(id resource);
+@@ -781,6 +781,16 @@ static void answerMissing(NSInvocation *invocation) {
+ // The wait takes a strong snapshot of already-committed buffers; new commits require the
+ // caller's usual resource synchronization. Storage dependency checks are in the runtime.
+ static NSMutableSet *gInFlight;
++// The surface of the frame handed to the display (tvOS's twlhook): its drawing is committed after that, and the display takes it when that is done.
++extern "C" int native_gop_flip(uint32_t surface);
++extern "C" int native_gop_flip_wait(uint32_t surface);
++static std::atomic<uint32_t> gFlipTarget{0};
++static std::atomic<bool> gFlipRefused{false};
++extern "C" __attribute__((visibility("default"))) int native_gop_flip_target(uint32_t surface) {
++ if(gFlipRefused.load())return 0;
++ gFlipTarget=surface;
++ return 1;
++}
+ static void waitForResource(id resource);
+ // Resource SPI the runtime has no state for: no protected content (Metal's default options), and no owner transfer
+ // (memory attribution is the kernel driver's, by the importing task), refused as not supported.
+@@ -796,6 +806,7 @@ static void waitForResource(id resource);
  @property(nonatomic) void *wrapped;
  @property(nonatomic,strong) id<MTLHeap> parentHeap;   // the heap that made the buffer, nil otherwise
  @property(nonatomic) NSUInteger heapOffset;
@@ -246,7 +349,7 @@ index cde587a..2c56e3d 100644
  @end
  @interface NBTexture : NBObject
  @property(nonatomic) NmbTexture *handle;
-@@ -809,6 +810,7 @@ static void waitForResource(id resource);
+@@ -809,6 +820,7 @@ static void waitForResource(id resource);
  @property(nonatomic,strong) id<MTLHeap> parentHeap;
  @property(nonatomic) NSUInteger heapOffset;
  @property(nonatomic) BOOL counted;   // its surface counted in use (countUse)
@@ -254,7 +357,7 @@ index cde587a..2c56e3d 100644
  - (void)countUse;
  @end
  // The render server counts the surfaces it textures in use while the textures live (countUse).
-@@ -886,9 +888,11 @@ static void watchImportPressure() {
+@@ -886,9 +898,11 @@ static void watchImportPressure() {
    dispatch_activate(source);
   });
  }
@@ -267,7 +370,7 @@ index cde587a..2c56e3d 100644
  }
  static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
   struct Key {uint64_t identity,address,bytes;};
-@@ -903,7 +907,7 @@ static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
+@@ -903,7 +917,7 @@ static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
   // The surface keeps its CPU mapping (the imported pages) until the import is freed.
   NmbBuffer *handle=nmb_buffer_new_no_copy_releasing(gDevice,base,bytes,MTLResourceStorageModeShared,releaseSurface,(void *)CFRetain(surface));
   if(!handle){CFRelease(surface);NBLOG(@"native-metal: surface import refused: %@",lastError());return nil;}
@@ -276,7 +379,7 @@ index cde587a..2c56e3d 100644
   if(key) {
    // Associations whose import is gone are pruned whenever the table has doubled since the last pruning; a live one is never evicted.
    if(gSurfaceImports.count>=gSurfaceImportsPruned) {
-@@ -1023,8 +1027,31 @@ static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out)
+@@ -1023,8 +1037,31 @@ static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out)
   }
   return true;
  }
@@ -309,7 +412,7 @@ index cde587a..2c56e3d 100644
  - (void)countUse {if(_surface && !_counted && gCountsSurfaceUse){IOSurfaceIncrementUseCount(_surface);_counted=YES;}}
  - (MTLTextureType)textureType {return (MTLTextureType)_descriptor.type;}
  - (MTLPixelFormat)pixelFormat {return (MTLPixelFormat)(_pvrtc?_pvrtc:_descriptor.format);}
-@@ -1318,24 +1345,37 @@ static bool methodABI(id object,SEL selector,const char *encoding) {
+@@ -1318,24 +1355,37 @@ static bool methodABI(id object,SEL selector,const char *encoding) {
   Method method=class_getInstanceMethod(object_getClass(object),selector);
   return method && !strcmp(method_getTypeEncoding(method),encoding);
  }
@@ -348,7 +451,7 @@ index cde587a..2c56e3d 100644
  static std::string quartzCoreCallers();
  // A Core Image kernel library (metallib file_type 1: ci_stdlib, ci_filters, ci_raw, ci_stdlib_h) lists its kernels as TYPE 5 entries over
  // one shared module. Metal names none of them (functionNames is empty) yet answers newFunctionWithName: and
-@@ -1356,7 +1396,7 @@ static NBFunction *ciKernelFunction(NBLibrary *library,NSString *name);
+@@ -1356,7 +1406,7 @@ static NBFunction *ciKernelFunction(NBLibrary *library,NSString *name);
   if(NBFunction *kernel=ciKernelFunction(self,name)){if(error)*error=nil;return (id<MTLFunction>)kernel;}
   if(!values)values=[MTLFunctionConstantValues new];
   if(!name || !values || !methodABI(values,@selector(newIndexedConstantArray),"@16@0:8") || !methodABI(values,@selector(newNamedConstantArray),"@16@0:8")) {
@@ -357,7 +460,7 @@ index cde587a..2c56e3d 100644
   }
   MTLFunctionConstantValues *snapshot=[values copy];
   NSArray *indexed=[snapshot newIndexedConstantArray],*named=[snapshot newNamedConstantArray];
-@@ -1364,11 +1404,14 @@ static NBFunction *ciKernelFunction(NBLibrary *library,NSString *name);
+@@ -1364,11 +1414,14 @@ static NBFunction *ciKernelFunction(NBLibrary *library,NSString *name);
   for(unsigned group=0;group<2;group++)for(id value in (group?named:indexed)) {
    if(!methodABI(value,@selector(dataType),"Q16@0:8") || !methodABI(value,@selector(data),"^v16@0:8") ||
       !methodABI(value,group?@selector(name):@selector(index),group?"@16@0:8":"Q16@0:8")) {
@@ -374,7 +477,7 @@ index cde587a..2c56e3d 100644
    constants.push_back({v.dataType,group?0:v.index,group?v.name.UTF8String:nullptr,v.data,bytes});
   }
   std::string text;
-@@ -1387,10 +1430,7 @@ static NBFunction *ciKernelFunction(NBLibrary *library,NSString *name);
+@@ -1387,10 +1440,7 @@ static NBFunction *ciKernelFunction(NBLibrary *library,NSString *name);
        (unsigned long long)(nowUs()-functionBegan),handle?1:0);
    journal(head+std::string(name.UTF8String?:"?")+" k="+text+(handle?std::string():" err="+std::string(lastError().UTF8String?:"?"))+" | "+quartzCoreCallers());
   }
@@ -386,7 +489,7 @@ index cde587a..2c56e3d 100644
   NBFunction *function=[NBFunction new];function.handle=handle;function.name=name;function.functionType=(MTLFunctionType)nmb_function_type(handle);
   function.constantsText=text;function.library=self;function.constantValues=snapshot;if(error)*error=nil;return (id<MTLFunction>)function;
  }
-@@ -1405,7 +1445,7 @@ static NBFunction *ciKernelFunction(NBLibrary *library,NSString *name);
+@@ -1405,7 +1455,7 @@ static NBFunction *ciKernelFunction(NBLibrary *library,NSString *name);
   if(!d.name){if(error)*error=nbError(@"a function name is required");return nil;}
   if(d.constantValues)return [self newFunctionWithName:d.name constantValues:d.constantValues error:error];
   id<MTLFunction> function=[self newFunctionWithName:d.name];
@@ -395,7 +498,15 @@ index cde587a..2c56e3d 100644
   if(error)*error=nil;return function;
  }
  - (NSArray<NSString *> *)functionNames {
-@@ -2791,6 +2831,17 @@ static char kUserDictionaryKey;
+@@ -1715,6 +1765,7 @@ static void dumpSurfacesOnce(NSSet *textures,NSSet *owners) {
+ @property(atomic) BOOL submitted;   // the runtime has been given the commit (the encoding thread's half of it, -submit)
+ @property(nonatomic) uint64_t committedUs;
+ @property(nonatomic) uint32_t commitIndex;
++@property(nonatomic) uint32_t flipSurface;   // boot-arg fb_flip: the frame this draws goes on the display when it completes
+ @property(nonatomic,strong) NSMutableArray *scheduledHandlers,*completedHandlers;
+ @property(nonatomic,strong) NSMutableSet *surfaces;
+ // Runtime handles retain GPU storage, but only the Objective-C owner retains
+@@ -2791,6 +2842,17 @@ static char kUserDictionaryKey;
     uint64_t seen=gBiggestPass.load();while(pixels>seen && !gBiggestPass.compare_exchange_weak(seen,pixels)){}
     if(pixels>=2000000)gFullScreenPasses++;
    }
@@ -413,7 +524,18 @@ index cde587a..2c56e3d 100644
   }
   auto attachment=[&](MTLRenderPassAttachmentDescriptor *a,NmbPassAttachment &out)->bool {
    if(!a.texture)return true;
-@@ -2998,6 +3049,13 @@ extern "C" void NBWaitInFlight(uint64_t beforeUs) {
+@@ -2908,6 +2970,10 @@ static char kUserDictionaryKey;
+  if(self.committed){NBLOG(@"native-metal: commit twice");return;}
+  self.committed=YES;
+  self.committedUs=nowUs();
++ if(const uint32_t target=gFlipTarget.load())
++  for(NBTexture *texture in _surfaces)if(texture.surface && IOSurfaceGetID(texture.surface)==target){self.flipSurface=target;break;}
++ // Drawing into the surface the display left last: the time to here covered most of the display's change of frame.
++ if(self.flipSurface)native_gop_flip_wait(self.flipSurface);
+  commitCpu=threadCpuUs();commitTid=threadIdLow();sampleWindowClose();
+  {
+   std::lock_guard<std::mutex> lock(gCommitLock);
+@@ -2998,11 +3064,43 @@ extern "C" void NBWaitInFlight(uint64_t beforeUs) {
   for(NBCommandBuffer *commandBuffer in pending)
    if(commandBuffer.committed && !commandBuffer.failedLocally && commandBuffer.committedUs<=beforeUs)nmb_command_buffer_wait(commandBuffer.handle,0);
  }
@@ -422,12 +544,42 @@ index cde587a..2c56e3d 100644
 +extern "C" __attribute__((visibility("default"))) void native_bridge_metal_wait_committed(uint64_t beforeUs) {
 + NSArray *pending;@synchronized(gInFlight){pending=gInFlight.allObjects;}
 + for(NBCommandBuffer *commandBuffer in pending)
-+  if(commandBuffer.committed && !commandBuffer.failedLocally && commandBuffer.committedUs<=beforeUs)nmb_command_buffer_wait(commandBuffer.handle,0);
++  if(commandBuffer.committed && !commandBuffer.failedLocally && commandBuffer.committedUs<=beforeUs)[commandBuffer waitUntilCompleted];
++}
++// Commits so far: tvOS's twlhook counts the ones that come after a frame is handed to the display.
++extern "C" __attribute__((visibility("default"))) uint64_t native_bridge_metal_commits(void) {return gCommits.load();}
++// The frame the display's presenter copies to the panel: the surface CoreAnimation drew, named here by tvOS's twlhook, so that no processor
++// copies it to the surface the swap names. native_gop_set_source answers 0 while no presenter is waiting for frames: the caller then copies as before.
++static std::mutex gGopLock;
++static IOSurfaceRef gGopSource;
++static uint64_t gGopSourceUs;
++static std::atomic<uint64_t> gGopAliveUs{0};
++extern "C" void native_gop_alive(void) {gGopAliveUs=nowUs();}
++extern "C" __attribute__((visibility("default"))) int native_gop_set_source(IOSurfaceRef surface,uint64_t committedUs) {
++ if(!surface || nowUs()-gGopAliveUs.load()>500000)return 0;
++ CFRetain(surface);
++ IOSurfaceRef old;
++ {std::lock_guard<std::mutex> lock(gGopLock);old=gGopSource;gGopSource=surface;gGopSourceUs=committedUs;}
++ if(old)CFRelease(old);
++ return 1;
++}
++// The latest source, retained for the caller, and the time its drawing was committed by.
++extern "C" IOSurfaceRef native_gop_copy_source(uint64_t *committedUs) {
++ std::lock_guard<std::mutex> lock(gGopLock);
++ if(gGopSource)CFRetain(gGopSource);
++ *committedUs=gGopSourceUs;
++ return gGopSource;
 +}
  static void scheduled(void *context) {[(__bridge NBCommandBuffer *)context didSchedule];}
  // The runtime's completion: the command buffer's own reference, taken at commit, is given back here.
  static void completed(void *context) {
-@@ -3101,6 +3159,10 @@ static std::string quartzCoreCallers() {
+  gCompleted++;
+  NBCommandBuffer *commandBuffer=(__bridge_transfer NBCommandBuffer *)context;
++ if(commandBuffer.flipSurface && !native_gop_flip(commandBuffer.flipSurface))gFlipRefused=true;
+  {
+   const uint64_t took=nowUs()-commandBuffer.committedUs;
+   // What the GPU itself took (its two timestamps, in the host's clock) and how long after the commit it began: ctc minus these is the queue's delay.
+@@ -3101,6 +3199,10 @@ static std::string quartzCoreCallers() {
    header=(uintptr_t)info.dli_fbase;
    snprintf(item,sizeof item," %lx",(unsigned long)((uintptr_t)frames[i]-header));out+=item;++kept;
   }
@@ -438,7 +590,7 @@ index cde587a..2c56e3d 100644
   // The context's own flags (int-154: the draws never took the generic path, which only bit 18 of MetalContext +0x1a0 or the debug byte
   // can cause, and the debug byte was 0). MetalContext::create_pipeline_state (header +0x143000) saves its caller's x19 at fp-8, and its
   // caller MetalContext::draw keeps `this` in x19: the frame record whose return address is +0x143214 links to that frame. Read with
-@@ -3878,14 +3940,16 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
+@@ -3878,14 +3980,16 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  }
  - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d {
   NmbTextureDescriptor descriptor;if(!textureDescriptor(d,&descriptor))return nil;
@@ -457,7 +609,7 @@ index cde587a..2c56e3d 100644
   if(isPvrtc(d.pixelFormat))texture.pvrtc=(uint32_t)d.pixelFormat;
   return (id<MTLTexture>)texture;
  }
-@@ -4254,7 +4318,9 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
+@@ -4254,7 +4358,9 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
  #if defined(__arm64e__)
   if(!base){NBLOG(@"native-metal: no _MTLDevice");return nil;}
  #else
