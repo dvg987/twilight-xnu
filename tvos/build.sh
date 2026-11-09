@@ -8,6 +8,7 @@
 #
 # env: JOBS="labels"  the tvOS jobs started at boot (default below); REST=1 the others on demand
 #      ARGS="..."     more boot-args;  OSLOG="labels" jobs whose os_log goes to the console
+#      VDEC=1         the hardware H.264 decoder for VideoToolbox (and its boot-args optee=2 vdec=7)
 #      VAR=1          /private/var kept on the eMMC: emmc=2 var_hfs=emmc_darwin_data (the data volume, darwin from
 #                     4 GiB on: tools/twl-datavol.py, written once from the rescue Linux by tools/twl-datavol-write.py)
 #      JB=1           the package manager's prefix (tools/twl-jb.sh: work/twl-jb) in the image as /redwood/jb, for
@@ -152,6 +153,27 @@ if [ -n "$TVAUDIO" ]; then
 	cp $O/obj/TwlAudio $O/root/lib/TwlAudio.driver/
 	cp tvos/src/twlaudio.plist $O/root/lib/TwlAudio.driver/Info.plist
 	ln -s /redwood/lib/TwlAudio.driver $O/root/hal/TwlAudio.driver
+fi
+# the hardware H.264 decoder (VDEC=1): tvos/src/twlvdec.c as /System/Library/VideoDecoders/AVD.videodecoder (the image's
+# vdecoders/, which init puts over the volume's directory), the name VideoToolbox loads in every process and calls
+# AVDRegister in. It drives /dev/twl-vdec-probe, which the kernel has with optee=2 vdec=7; one decoder at a time, the
+# others fall back to software. Kodi also gets tvos/src/twlcvgl.c: CoreVideo's GL texture import needs Apple's GPU.
+if [ -n "${VDEC-}" ]; then
+	mkdir -p $O/root/vdecoders
+	$DYN -Wall -Wno-pointer-sign -Ihakios/xnu/files/bsd -dynamiclib \
+		-install_name /System/Library/VideoDecoders/AVD.videodecoder -framework CoreFoundation \
+		-framework CoreMedia -framework CoreVideo -framework VideoToolbox -framework IOSurface -o $O/obj/AVD.videodecoder \
+		tvos/src/twlvdec.c tvos/video/h264/dpb.c tvos/video/h264/h264_dpb.c tvos/video/hevc/hevc_dpb.c tvos/video/vp9/vp9_dpb.c
+	$DYN -Wno-deprecated-declarations -dynamiclib -install_name /redwood/lib/libtwlcvgl.dylib \
+		-Ihakios/xnu/files/bsd -framework CoreFoundation -framework CoreVideo -framework IOSurface -framework OpenGLES -lobjc -o $O/obj/libtwlcvgl.dylib tvos/src/twlcvgl.c
+	for f in AVD.videodecoder libtwlcvgl.dylib; do
+		python3 tools/macho-tvos.py $O/obj/$f
+		$LDID -S -Cadhoc $O/obj/$f
+	done
+	cp $O/obj/AVD.videodecoder $O/root/vdecoders/
+	cp $O/obj/libtwlcvgl.dylib $O/root/lib/
+	echo "/redwood/lib/libtwlcvgl.dylib Kodi" >> $O/root/etc/inject.conf
+	ARGS="$ARGS optee=2 optee_delay=10 vdec=7 vdec_delay=25"
 fi
 # bluetoothd, one instruction changed: every pairing agent registers as one that answers pairing requests itself
 # (kCBMsgArgProgrammaticPairing), so a "Just Works" request goes to Settings' agent, which tvos/src/twlbt.c answers at

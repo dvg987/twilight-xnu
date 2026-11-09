@@ -26,6 +26,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "hakios.hdmiaudio.h"
@@ -298,7 +299,8 @@ static OSStatus create_device(__unused AudioServerPlugInDriverRef d, __unused CF
     __unused AudioObjectID *o) { return kAudioHardwareUnsupportedOperationError; }
 static OSStatus destroy_device(__unused AudioServerPlugInDriverRef d, __unused AudioObjectID o) { return kAudioHardwareUnsupportedOperationError; }
 static OSStatus device_client(__unused AudioServerPlugInDriverRef d, __unused AudioObjectID o, __unused const AudioServerPlugInClientInfo *i) { return 0; }
-static OSStatus configuration_change(__unused AudioServerPlugInDriverRef d, __unused AudioObjectID o, __unused UInt64 a, __unused void *i) { return 0; }
+static OSStatus perform_configuration_change(AudioServerPlugInDriverRef d, AudioObjectID o, UInt64 action, void *info);
+static OSStatus abort_configuration_change(__unused AudioServerPlugInDriverRef d, __unused AudioObjectID o, __unused UInt64 a, __unused void *i) { return 0; }
 
 struct value {
 	UInt32 size;
@@ -375,9 +377,13 @@ property(AudioObjectID object, const AudioObjectPropertyAddress *address)
 		case kAudioDevicePropertyModelUID: STRING(CFSTR(TWL_DEVICE_UID)); break;
 		case kAudioDevicePropertyTransportType: WORD(TRANSPORT_HDMI); break;
 		case kAudioDevicePropertyRelatedDevices: WORD(OBJECT_DEVICE); break;
+		/* how far ahead of the play head the audio server writes: with none, a late I/O cycle left the hardware ring empty
+		 * (an underrun a second, with a game playing); 1024 frames, 21 ms */
+		case kAudioDevicePropertySafetyOffset: WORD(1024); break;
+		/* the kernel starts the stream 60 ms ahead of the hardware (hakios.hdmiaudio.c, lead_ms): that is when what is written
+		 * plays, which players need to know to keep the picture and the sound together */
+		case kAudioDevicePropertyLatency: WORD(TWL_RATE * 60 / 1000); break;
 		case kAudioDevicePropertyClockDomain:
-		case kAudioDevicePropertyLatency:
-		case kAudioDevicePropertySafetyOffset:
 		case kAudioDevicePropertyIsHidden: WORD(0); break;
 		case kAudioDevicePropertyDeviceIsAlive: WORD(1); break;
 		case kAudioDevicePropertyDeviceCanBeDefaultDevice:
@@ -534,7 +540,9 @@ get_property_data(AudioServerPlugInDriverRef driver, AudioObjectID object, pid_t
 	if (address->mSelector == 'cfsz' && qsize == sizeof(UInt32) && qualifier != NULL) {
 		UInt32 want = *(const UInt32 *)qualifier;
 
-		v.u.words[0] = want < 32 ? 32 : want > TIMESTAMP_PERIOD ? TIMESTAMP_PERIOD : want;
+		/* at least 512 frames (10.7 ms): a game asks for a few milliseconds, and at 32 frames the audio server ran some 1500 I/O
+		 * cycles a second, mixing all of the game's voices each time -- two of the four cores, with Minecraft playing */
+		v.u.words[0] = want < 512 ? 512 : want > TIMESTAMP_PERIOD ? TIMESTAMP_PERIOD : want;
 	}
 	if (object == OBJECT_PLUGIN && address->mSelector == kAudioPlugInPropertyTranslateUIDToDevice && qsize == sizeof(CFStringRef) &&
 	    qualifier != NULL && *(const CFStringRef *)qualifier != NULL && CFEqual(*(const CFStringRef *)qualifier, CFSTR(TWL_DEVICE_UID))) {
@@ -557,11 +565,24 @@ get_property_data(AudioServerPlugInDriverRef driver, AudioObjectID object, pid_t
 	return 0;
 }
 
+/*
+ * The device's timeline: the kernel's count of frames played starts again at 0 with each format it is given, and a
+ * format change (Kodi's 5.1 after the menus' stereo) gave the audio server a sample time that went back to 0 under the
+ * same seed while its I/O ran on: it then ran 85% of real time and Kodi's output timed out and was opened again, and
+ * again. The count goes on from where it was instead (frame_base), and the seed changes with each restart.
+ */
+static UInt64 frame_base, last_hal_frames, anchor_whole = ~0ull, anchor_host;
+static UInt32 clock_seed = 1;
+
 /* The path in the kernel for the format now current (kind, channel count) */
 static void
 kernel_format(void)
 {
 	struct twl_audio_format f = { formats[current].kind, formats[current].hw_rate, formats[current].hw_channels, 16 };
+
+	frame_base = last_hal_frames;
+	anchor_whole = ~0ull;
+	clock_seed++;
 
 	if (sink >= 0 && ioctl(sink, TWL_AUDIO_SET_FORMAT, &f) < 0) {
 		say("twilight: audio: the kernel would not take %u channels, kind %u (%s)\n", f.channels, f.kind, strerror(errno));
@@ -643,22 +664,45 @@ set_property_data(AudioServerPlugInDriverRef driver, AudioObjectID object, pid_t
 		for (unsigned i = 0; i < format_count; i++) {
 			if (w->mFormatID == formats[i].id && w->mChannelsPerFrame == formats[i].channels && w->mSampleRate == TWL_RATE &&
 			    w->mBitsPerChannel == 16) {
-				AudioObjectPropertyAddress layout = { 'srnd', kAudioObjectPropertyScopeOutput, 0 };
-
-				current = i;
-				if (host != NULL) {
-					host->PropertiesChanged(host, OBJECT_DEVICE, 1, &layout);
-				}
-				if (running) {
-					kernel_format();
-				}
+				/* through the host (it stops I/O and sizes its buffers for the new format, then calls
+				 * perform_configuration_change): switched here directly, its buffers kept the old size, and a
+				 * 2048-frame cycle of 6-channel PCM went out as 682 frames of sound and 1366 of silence (the 8 KiB
+				 * of a stereo cycle), the "audio through a fan" of YouTube's 5.1 */
 				pthread_mutex_unlock(&lock);
-				return 0;
+				if (i == current) {
+					return 0;
+				}
+				if (host == NULL) {
+					return kAudioHardwareIllegalOperationError;
+				}
+				return host->RequestDeviceConfigurationChange(host, OBJECT_DEVICE, i, NULL);
 			}
 		}
 		pthread_mutex_unlock(&lock);
 		return kAudioDeviceUnsupportedFormatError;
 	}
+}
+
+/* the host's go-ahead for a change asked for above: the format whose index is `action' becomes the current one */
+static OSStatus
+perform_configuration_change(__unused AudioServerPlugInDriverRef d, AudioObjectID o, UInt64 action, __unused void *info)
+{
+	AudioObjectPropertyAddress layout = { 'srnd', kAudioObjectPropertyScopeOutput, 0 };
+
+	if (o != OBJECT_DEVICE || action >= format_count) {
+		return kAudioHardwareBadObjectError;
+	}
+	pthread_mutex_lock(&lock);
+	current = (unsigned)action;
+	if (running) {
+		kernel_format();
+	}
+	pthread_mutex_unlock(&lock);
+	say("twilight: audio: format %u (%u ch) by a configuration change\n", (unsigned)action, formats[action].channels);
+	if (host != NULL) {
+		host->PropertiesChanged(host, OBJECT_DEVICE, 1, &layout);
+	}
+	return 0;
 }
 
 static OSStatus
@@ -714,11 +758,22 @@ get_zero_time_stamp(__unused AudioServerPlugInDriverRef driver, AudioObjectID ob
 	}
 	pthread_mutex_lock(&lock);
 	if (have_position && sink >= 0 && ioctl(sink, TWL_AUDIO_GET_POSITION, &pos) == 0 && pos.running) {
-		UInt64 hal_frames = pos.frames / formats[current].rate_div, whole = hal_frames / TIMESTAMP_PERIOD;
+		UInt64 hal_frames = frame_base + pos.frames / formats[current].rate_div, whole = hal_frames / TIMESTAMP_PERIOD;
 
+		last_hal_frames = hal_frames;
+
+		/*
+		 * A period's zero time stamp is worked out once and then given again: read afresh each call it moved by the DMA
+		 * pointer's steps, the audio server took that for its clock jumping and skipped I/O cycles (a 512-frame cycle about
+		 * every second, 1.2% of the stream: the ring ran dry every few seconds with a game playing)
+		 */
+		if (whole != anchor_whole) {
+			anchor_host = pos.mach_time - (UInt64)((Float64)(hal_frames - whole * TIMESTAMP_PERIOD) * ticks_per_frame);
+			anchor_whole = whole;
+		}
 		*sample_time = (Float64)(whole * TIMESTAMP_PERIOD);
-		*host_time = pos.mach_time - (UInt64)((Float64)(hal_frames - whole * TIMESTAMP_PERIOD) * ticks_per_frame);
-		*seed = 1;
+		*host_time = anchor_host;
+		*seed = clock_seed;
 		pthread_mutex_unlock(&lock);
 		return 0;
 	}
@@ -727,9 +782,39 @@ get_zero_time_stamp(__unused AudioServerPlugInDriverRef driver, AudioObjectID ob
 	}
 	*sample_time = (Float64)periods * TIMESTAMP_PERIOD;
 	*host_time = anchor + (UInt64)((Float64)periods * ticks_per_period);
-	*seed = 1;
+	*seed = clock_seed;
 	pthread_mutex_unlock(&lock);
 	return 0;
+}
+
+/* touch /var/tmp/twlaudio-debug: every 2 s of I/O, what was written, what the hardware played and the kernel's counts,
+ * to /var/tmp/twlaudio.log (the audio server's standard error goes nowhere) */
+static void
+io_log(UInt32 frames)
+{
+	static UInt64 since, cycles, frames_since, hw_at;
+	UInt64 now = mach_absolute_time();
+	struct twl_audio_position pos = { 0 };
+
+	cycles++;
+	frames_since += frames;
+	if (since == 0) since = now;
+	if ((Float64)(now - since) < 2.0 * TWL_RATE * ticks_per_frame) return;
+	if (access("/var/tmp/twlaudio-debug", F_OK) == 0 && sink >= 0 && ioctl(sink, TWL_AUDIO_GET_POSITION, &pos) == 0) {
+		FILE *f = fopen("/var/tmp/twlaudio.log", "a");
+		if (f) {
+			struct timespec t;
+			clock_gettime(CLOCK_MONOTONIC, &t);
+			fprintf(f, "%ld.%03ld: %llu cycles, %llu frames in %.2f s; hardware +%llu frames, fill %u, underruns %u, dropped %u, "
+			    "refused %llu, running %u\n", (long)t.tv_sec, t.tv_nsec / 1000000, cycles, frames_since,
+			    (Float64)(now - since) / ticks_per_frame / TWL_RATE, pos.frames - hw_at, pos.fill_frames, pos.underruns,
+			    pos.dropped_frames, refused, pos.running);
+			fclose(f);
+		}
+		hw_at = pos.frames;
+	}
+	since = now;
+	cycles = frames_since = 0;
 }
 
 static OSStatus
@@ -761,13 +846,14 @@ do_io_operation(__unused AudioServerPlugInDriverRef driver, __unused AudioObject
 			refused += frames;
 		}
 		written += frames;
+		io_log(frames);
 	}
 	return 0;
 }
 
 static AudioServerPlugInDriverInterface interface = {
 	NULL, query_interface, add_ref, release, initialize, create_device, destroy_device, device_client, device_client,
-	configuration_change, configuration_change, has_property, is_property_settable, get_property_data_size,
+	perform_configuration_change, abort_configuration_change, has_property, is_property_settable, get_property_data_size,
 	get_property_data, set_property_data, start_io, stop_io, get_zero_time_stamp, will_do_io_operation,
 	begin_end_io_operation, do_io_operation, begin_end_io_operation,
 };

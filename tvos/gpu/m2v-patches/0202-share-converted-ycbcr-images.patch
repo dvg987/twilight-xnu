@@ -1,0 +1,158 @@
+--- a/crates/metal2vulkan-runtime/src/texture.rs
++++ b/crates/metal2vulkan-runtime/src/texture.rs
+@@ -213,6 +213,15 @@
+     pub(super) first_moves: first_move::FirstMoves,
+     /// The decoded twins' CPU decodes and the thread that runs them (`texture/twin_decode.rs`).
+     pub(super) twin_decodes: twin_decode::TwinDecodes,
++    /// twilight: the images two-plane YCbCr textures are converted into, one per kind of image
++    /// (`texture/ycbcr_image.rs`), with the view the conversion writes: every texture of a kind
++    /// converts into the same image before each use.
++    pub(super) converted_images:
++        Mutex<HashMap<ycbcr_image::ConvertedKey, (std::sync::Weak<Image>, vk::ImageView)>>,
++    /// twilight: the staging buffers the conversions copy the planes' bytes into, one per layout
++    /// of planes (`ycbcr.rs`): each conversion writes it whole before its dispatch reads it.
++    pub(crate) converted_staging:
++        Mutex<HashMap<(metal2vulkan::bind::YCbCrPlanes, u64), crate::buffer::WeakBuffer>>,
+ }
+ 
+ impl TextureState {
+@@ -244,6 +253,8 @@
+             storage_forms: storage_form::StorageForms::default(),
+             first_moves: first_move::FirstMoves::default(),
+             twin_decodes: twin_decode::TwinDecodes::default(),
++            converted_images: Mutex::new(HashMap::new()),
++            converted_staging: Mutex::new(HashMap::new()),
+         }
+     }
+ 
+--- a/crates/metal2vulkan-runtime/src/texture/ycbcr_image.rs
++++ b/crates/metal2vulkan-runtime/src/texture/ycbcr_image.rs
+@@ -158,28 +158,55 @@
+             }
+         }
+         let hazard = texels.options().hazard_tracking_mode()?;
+-        let image = self.new_image(plan, layout, descriptor, hazard)?;
+-        let view = image.view(&VkView {
+-            view_type: ImageViewType::TYPE_2D,
+-            format: written,
+-            components: ComponentMapping::IDENTITY,
+-            aspect: ImageAspectFlags::COLOR,
+-            base_level: 0,
+-            level_count: 1,
+-            base_layer: 0,
+-            layer_count: 1,
+-            usage: ImageUsageFlags::STORAGE,
+-        })?;
++        // twilight: one image for every texture of this kind, not one each. A video's textures
++        // (CoreAnimation makes one over each decoder buffer, some 36 of them) each held a
++        // 16 MiB R16G16B16A16 image of 1920x1088: backboardd went past 600 MB and was killed. The
++        // conversion is made again before every use (no memo below), so an image another texture
++        // wrote since is converted over first; the tracker orders the uses of the one image.
++        let key = ConvertedKey {
++            format,
++            written,
++            extent: plan.extent,
++            levels: plan.levels,
++            layers: plan.layers,
++            usage: plan.usage.as_raw(),
++            flags: plan.flags.as_raw(),
++            view_formats: plan.view_formats.iter().map(|f| f.as_raw()).collect(),
++            hazard: format!("{hazard:?}"),
++        };
++        let mut images = lock(&self.shared().textures.converted_images);
++        images.retain(|_, (held, _)| held.strong_count() > 0);
++        let found = images
++            .get(&key)
++            .and_then(|(held, view)| held.upgrade().map(|image| (image, *view)));
++        let (image, view) = match found {
++            Some(found) => found,
++            None => {
++                let image = self.new_image(plan, layout, descriptor, hazard)?;
++                let view = image.view(&VkView {
++                    view_type: ImageViewType::TYPE_2D,
++                    format: written,
++                    components: ComponentMapping::IDENTITY,
++                    aspect: ImageAspectFlags::COLOR,
++                    base_level: 0,
++                    level_count: 1,
++                    base_layer: 0,
++                    layer_count: 1,
++                    usage: ImageUsageFlags::STORAGE,
++                })?;
++                let image = image.shared();
++                images.insert(key, (Arc::downgrade(&image), view));
++                (image, view)
++            }
++        };
++        drop(images);
+         let (raw, at) = texels.buffer.at(span.start);
+         let conversion = YCbCrConversion::new(self, (planes, span.clone()), at, view)?;
+         let (bytes, tracked) = texels.buffer.tracked(span.clone());
+         let alias = texels.buffer.alias().map(|alias| alias.key);
+-        let memo = Memo::of(
+-            &texels.buffer,
+-            span,
+-            std::iter::once(bytes.key).chain(alias),
+-        );
+-        let conversion = conversion.with_memo(memo);
++        // (no memo: the image is shared, see above)
++        let _ = span;
++        let conversion = conversion.with_memo(None::<Memo>);
+         let copies = ShadowCopies {
+             source: ShadowSource::Converted {
+                 buffer: ShadowBuffer::of(&texels.buffer, raw),
+@@ -200,13 +227,27 @@
+             drops_writes: true,
+         };
+         Ok(Storage::Shadow {
+-            image: image.shared(),
++            image,
+             texels,
+             copies: Arc::new(copies),
+         })
+     }
+ }
+ 
++/// twilight: what makes two converted images the same (`converted_storage`).
++#[derive(Clone, Debug, PartialEq, Eq, Hash)]
++pub(crate) struct ConvertedKey {
++    format: Format,
++    written: Format,
++    extent: [u32; 3],
++    levels: u32,
++    layers: u32,
++    usage: u32,
++    flags: u32,
++    view_formats: Vec<i32>,
++    hazard: String,
++}
++
+ impl Texture {
+     /// The storage of a view presenting `record` of this texture in its `_sRGB` twin's format
+     /// (`view_plan::check_format` admits `YCBCR8_420_2P` as `YCBCR8_420_2P_sRGB` and
+--- a/crates/metal2vulkan-runtime/src/ycbcr.rs
++++ b/crates/metal2vulkan-runtime/src/ycbcr.rs
+@@ -453,7 +453,22 @@
+         let chroma_end = chroma_at + chroma_pitch * (ch.max(1) - 1) + chroma_row;
+         let zeros = chroma_end.saturating_sub(bytes).next_multiple_of(4);
+         let held = bytes + zeros;
+-        let staging = device.own_buffer(BYTES_AT + held, ResourceOptions::private())?;
++        // twilight: one staging buffer per layout of planes, not one per texture: CoreAnimation
++        // makes a texture over each new video frame's surface and keeps them a while, and each
++        // held some 3 MiB of staging; every conversion writes the shape and the planes again
++        // first, and the tracker orders the uses of the one buffer.
++        let staging = {
++            let mut held_buffers = crate::device::lock(&device.shared().textures.converted_staging);
++            held_buffers.retain(|_, weak| weak.lives());
++            match held_buffers.get(&(*planes, held)).and_then(|weak| weak.upgrade()) {
++                Some(buffer) => buffer,
++                None => {
++                    let buffer = device.own_buffer(BYTES_AT + held, ResourceOptions::private())?;
++                    held_buffers.insert((*planes, held), buffer.downgrade());
++                    buffer
++                }
++            }
++        };
+         let (raw, start) = staging.at(0);
+         let (identity, range) = staging.tracked(0..BYTES_AT + held);
+         let shape = YCbCrConvertModule::shape(planes);

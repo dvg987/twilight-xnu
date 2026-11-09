@@ -19,6 +19,7 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <dispatch/dispatch.h>
 #include <dlfcn.h>
+#include <fcntl.h>
 #include <mach-o/dyld.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
@@ -28,6 +29,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/sysctl.h>
 #include <unistd.h>
 
 extern const void *_dyld_get_shared_cache_range(size_t *length);
@@ -50,6 +52,17 @@ say(const char *format, ...)
 		n = sizeof(line) - 1;
 	}
 	write(2, line, (size_t)n);
+	{
+		/* (a copy for ssh: the console's goes only to the run's log) */
+		static int fd = -2;
+
+		if (fd == -2) {
+			fd = open("/var/tmp/twl-pb.log", O_WRONLY | O_APPEND | O_CREAT, 0644);
+		}
+		if (fd >= 0) {
+			write(fd, line, (size_t)n);
+		}
+	}
 }
 
 static IMP
@@ -300,6 +313,248 @@ hook_pb_selector(const char *image, const char *selector, IMP replacement)
 	free(names);
 }
 
+/*
+ * A TV out (kern.fb_external, the default): backboardd draws a 1920x1080 canvas in every mode (tvos/src/twlhook.c), so a
+ * mode taller than 1080 lines is scale 1 (CoreAnimation says 2): the apps' screens are 1920x1080 points.
+ */
+static unsigned long (*mode_scale_o)(obj_t, SEL);
+
+static unsigned long
+mode_scale(obj_t self, SEL sel)
+{
+	unsigned long r = mode_scale_o(self, sel);
+
+	return r > 1 && SEND0(unsigned long, self, "height") > 1080 ? 1 : r;
+}
+
+static void
+tv_out_scale(void)
+{
+	uint32_t external = 0;
+	size_t size = sizeof(external);
+
+	if (sysctlbyname("kern.fb_external", &external, &size, NULL, 0) != 0 || external == 0 || access("/var/mobile/twl/nocanvas", F_OK) == 0) {
+		return;
+	}
+	mode_scale_o = (unsigned long (*)(obj_t, SEL))replace_method("CADisplayMode", "preferredScale", 0x1899ce110UL, (IMP)mode_scale);
+	if (mode_scale_o != NULL) {
+		say("twl: TV out: modes at scale 1\n");
+	}
+}
+
+/* (tracing the remote's Menu through PineBoard: which classes implement these, and what they answer) */
+#define TRACE_HOOKS 16
+static struct { Class cls; SEL sel; IMP original; } trace_hooks[TRACE_HOOKS];
+static unsigned trace_hook_count;
+
+static IMP
+trace_original(obj_t self, SEL sel)
+{
+	for (Class c = object_getClass((id)self); c != NULL; c = class_getSuperclass(c)) {
+		for (unsigned i = 0; i < trace_hook_count; i++) {
+			if (trace_hooks[i].cls == c && trace_hooks[i].sel == sel) {
+				return trace_hooks[i].original;
+			}
+		}
+	}
+	return NULL;
+}
+
+static long
+trace0(obj_t self, SEL sel)
+{
+	long r = ((long (*)(obj_t, SEL))trace_original(self, sel))(self, sel);
+
+	say("twl: trace -[%s %s] -> %ld\n", object_getClassName((id)self), sel_getName(sel), r);
+	return r;
+}
+
+static long
+trace1(obj_t self, SEL sel, obj_t a)
+{
+	long r;
+
+	say("twl: trace -[%s %s] %p ...\n", object_getClassName((id)self), sel_getName(sel), a);
+	r = ((long (*)(obj_t, SEL, obj_t))trace_original(self, sel))(self, sel, a);
+	say("twl: trace -[%s %s] -> %ld\n", object_getClassName((id)self), sel_getName(sel), r);
+	return r;
+}
+
+static long
+trace2(obj_t self, SEL sel, long a, obj_t b)
+{
+	long r;
+
+	say("twl: trace -[%s %s] %ld %p ...\n", object_getClassName((id)self), sel_getName(sel), a, b);
+	r = ((long (*)(obj_t, SEL, long, obj_t))trace_original(self, sel))(self, sel, a, b);
+	say("twl: trace -[%s %s] -> %ld\n", object_getClassName((id)self), sel_getName(sel), r);
+	return r;
+}
+
+static long
+trace3(obj_t self, SEL sel, obj_t a, obj_t b, obj_t c)
+{
+	say("twl: trace -[%s %s] (going Home?)\n", object_getClassName((id)self), sel_getName(sel));
+	return ((long (*)(obj_t, SEL, obj_t, obj_t, obj_t))trace_original(self, sel))(self, sel, a, b, c);
+}
+
+static void
+trace_selector(const char *image, const char *selector, IMP replacement)
+{
+	unsigned count = 0;
+	const char **names = objc_copyClassNamesForImage(image, &count);
+	SEL sel = sel_registerName(selector);
+
+	for (unsigned i = 0; names != NULL && i < count; i++) {
+		Class cls = objc_getClass(names[i]);
+		unsigned n = 0;
+		Method *methods = cls != NULL ? class_copyMethodList(cls, &n) : NULL;
+
+		for (unsigned k = 0; k < n; k++) {
+			if (method_getName(methods[k]) == sel && trace_hook_count < TRACE_HOOKS) {
+				trace_hooks[trace_hook_count].cls = cls;
+				trace_hooks[trace_hook_count].sel = sel;
+				trace_hooks[trace_hook_count].original = method_setImplementation(methods[k], replacement);
+				trace_hook_count++;
+				say("twl: tracing -[%s %s]\n", names[i], selector);
+			}
+		}
+		free(methods);
+	}
+	free(names);
+}
+
+/*
+ * (touch /var/mobile/twl/trace-modes: match-content's choices -- every PineBoard method about frame rates, display modes
+ * and match content, with its arguments and answer. arm64 passes integers and pointers in x2.. and doubles in d0..
+ * apart, so one hook of (x2, x3, x4, d0, d1) passes any mix of up to three of each through unchanged.)
+ */
+#define MODE_HOOKS 96
+static struct { Class cls; SEL sel; IMP original; char types[64]; unsigned told; } mode_hooks[MODE_HOOKS];
+static unsigned mode_hook_count;
+
+static int
+mode_hook(obj_t self, SEL sel)
+{
+	for (Class c = object_getClass((id)self); c != NULL; c = class_getSuperclass(c)) {
+		for (unsigned i = 0; i < mode_hook_count; i++) {
+			if (mode_hooks[i].cls == c && mode_hooks[i].sel == sel) {
+				return (int)i;
+			}
+		}
+	}
+	return -1;
+}
+
+static void
+describe(char *out, size_t size, char type, long x, double d)
+{
+	if (type == '@') {
+		obj_t s = x ? SEND0(obj_t, (obj_t)x, "description") : NULL;
+		const char *u = s ? SEND0(const char *, s, "UTF8String") : NULL;
+		snprintf(out, size, "%s", u ? u : "nil");
+		for (char *p = out; *p; p++) if (*p == '\n') *p = ' ';
+	} else if (type == 'd' || type == 'f') {
+		snprintf(out, size, "%.3f", d);
+	} else {
+		snprintf(out, size, "%ld", x);
+	}
+}
+
+static void
+mode_say(int h, obj_t self, SEL sel, const long *x, const double *d, long rx, double rd)
+{
+	const char *t = mode_hooks[h].types;   /* return type, then the arguments' (after self and _cmd) */
+	char line[1200], part[400];
+	unsigned xi = 0, di = 0;
+	size_t at = 0;
+
+	if (mode_hooks[h].told++ >= 40) return;
+	at += (size_t)snprintf(line + at, sizeof(line) - at, "twl: mode -[%s %s]", object_getClassName((id)self), sel_getName(sel));
+	for (const char *a = t + 1; *a && at < sizeof(line) - 2; a++) {
+		bool fp = *a == 'd' || *a == 'f';
+		describe(part, sizeof(part), *a, fp ? 0 : x[xi < 3 ? xi : 2], fp ? d[di < 2 ? di : 1] : 0);
+		fp ? di++ : xi++;
+		at += (size_t)snprintf(line + at, sizeof(line) - at, " (%s)", part);
+	}
+	if (t[0] != 'v' && at < sizeof(line) - 2) {
+		describe(part, sizeof(part), t[0], rx, rd);
+		at += (size_t)snprintf(line + at, sizeof(line) - at, " -> %s", part);
+	}
+	say("%.*s\n", (int)(at < sizeof(line) ? at : sizeof(line) - 1), line);
+}
+
+static long
+mode_x(obj_t self, SEL sel, long a, long b, long c, double d0, double d1)
+{
+	int h = mode_hook(self, sel);
+	long x[3] = { a, b, c };
+	double d[2] = { d0, d1 };
+	long r = ((long (*)(obj_t, SEL, long, long, long, double, double))mode_hooks[h].original)(self, sel, a, b, c, d0, d1);
+
+	mode_say(h, self, sel, x, d, r, 0);
+	return r;
+}
+
+static double
+mode_d(obj_t self, SEL sel, long a, long b, long c, double d0, double d1)
+{
+	int h = mode_hook(self, sel);
+	long x[3] = { a, b, c };
+	double d[2] = { d0, d1 };
+	double r = ((double (*)(obj_t, SEL, long, long, long, double, double))mode_hooks[h].original)(self, sel, a, b, c, d0, d1);
+
+	mode_say(h, self, sel, x, d, 0, r);
+	return r;
+}
+
+static void
+trace_modes(const char *image)
+{
+	static const char *const words[] = { "rameRate", "atchContent", "DisplayMode", "isplayCriteria", "RefreshRate",
+	    "DynamicRange", "dynamicRange", NULL };
+	unsigned count = 0;
+	const char **names = objc_copyClassNamesForImage(image, &count);
+
+	for (unsigned i = 0; names != NULL && i < count; i++) {
+		Class cls = objc_getClass(names[i]);
+		unsigned n = 0;
+		Method *methods = cls != NULL ? class_copyMethodList(cls, &n) : NULL;
+
+		for (unsigned k = 0; k < n && mode_hook_count < MODE_HOOKS; k++) {
+			const char *name = sel_getName(method_getName(methods[k]));
+			bool want = false;
+			char types[64];
+			unsigned args = method_getNumberOfArguments(methods[k]);
+			unsigned xs = 0, ds = 0;
+
+			for (unsigned w = 0; words[w] != NULL; w++) want = want || strstr(name, words[w]) != NULL;
+			if (!want) continue;
+			method_getReturnType(methods[k], types, 2);
+			if (strchr("@cBqQiIlLsSvdf", types[0]) == NULL || args > 2 + 5) continue;
+			bool ok = true;
+			for (unsigned a = 2; a < args && ok; a++) {
+				char at[8];
+				method_getArgumentType(methods[k], a, at, sizeof(at));
+				if (strchr("@cBqQiIlLsS:#", at[0]) != NULL) { xs++; types[a - 1] = at[0]; }
+				else if (at[0] == 'd' || at[0] == 'f') { ds++; types[a - 1] = at[0]; }
+				else ok = false;
+			}
+			if (!ok || xs > 3 || ds > 2) continue;
+			types[args - 1] = 0;
+			mode_hooks[mode_hook_count].cls = cls;
+			mode_hooks[mode_hook_count].sel = method_getName(methods[k]);
+			memcpy(mode_hooks[mode_hook_count].types, types, sizeof(types));
+			mode_hooks[mode_hook_count].original = method_setImplementation(methods[k],
+			    types[0] == 'd' || types[0] == 'f' ? (IMP)mode_d : (IMP)mode_x);
+			mode_hook_count++;
+		}
+		free(methods);
+	}
+	free(names);
+	say("twl: tracing %u methods about modes\n", mode_hook_count);
+}
+
 __attribute__((constructor)) static void
 twl_pb_init(void)
 {
@@ -321,6 +576,18 @@ twl_pb_init(void)
 			hook_pb_selector(name, "isApplicationEnabled:reasons:", (IMP)is_enabled);
 			hook_pb_selector(name, "isPlaceholderEnabled:reasons:", (IMP)is_enabled);
 			hook_pb_selector(name, "isApplicationHidden:", (IMP)is_hidden);
+			if (access("/var/mobile/twl/trace-menu", F_OK) == 0) {
+				trace_selector(name, "handleBackButton", (IMP)trace0);
+				trace_selector(name, "handleMenuSingleTapEvent:", (IMP)trace1);
+				trace_selector(name, "handleUnhandledMenuEvent", (IMP)trace0);
+				trace_selector(name, "_handleMenuOrACHomeSingleTapEventWithYesForMenuNoForACHome:recognizer:", (IMP)trace2);
+				trace_selector(name, "shouldForwardSystemAppEvent", (IMP)trace0);
+				trace_selector(name, "openKioskApplicationWithReason:options:completion:", (IMP)trace3);
+				trace_selector(name, "_checkForBulletinActivationForAction:", (IMP)trace1);
+			}
+			if (access("/var/mobile/twl/trace-modes", F_OK) == 0) {
+				trace_modes(name);
+			}
 		}
 	}
 	replace_method("SSDisplay", "setState:completion:", 0x1b3542ba8UL, (IMP)ss_display_set_state);
@@ -329,5 +596,6 @@ twl_pb_init(void)
 	original_did_update_readiness = (void (*)(obj_t, SEL, obj_t, bool))replace_pb_method("PBApplicationSceneViewController",
 	    "applicationSceneView:didUpdateReadiness:", 0x10017a320UL, (IMP)did_update_readiness);
 	replace_method("FBSDisplayConfiguration", "hardwareIdentifier", 0x187b1f034UL, (IMP)display_hardware_identifier);
+	tv_out_scale();
 	start_rechecks();
 }
