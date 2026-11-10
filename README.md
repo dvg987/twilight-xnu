@@ -53,6 +53,10 @@ Tested apps: Kodi, YouTube and Minecraft: Apple TV Edition.
 
 Nothing on the eMMC is written except one variable of U-Boot's environment (`bootcmd`).
 
+## A note on the code
+
+I don't expect the code or tools here to be very human readable, all of the development was done using Opus 5.5 and Fable 5.2. It does stupid things like adding comments in places where they don't belong and creating dozens of random tools that no human will ever understand. I fully expect only AI agents to actually be reading the source code and debugging so I just left it all in there.
+
 ## What is here
 
 | | |
