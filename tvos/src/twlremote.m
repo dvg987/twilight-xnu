@@ -27,6 +27,7 @@
 #include <fcntl.h>
 #include <mach-o/dyld.h>
 #include <notify.h>
+#include <objc/message.h>
 #include <objc/runtime.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
@@ -775,7 +776,7 @@ twl_remote_init(void)
 	uintptr_t slide;
 	Method method;
 
-	static int token;
+	static int token, youtube;
 
 	if (_NSGetExecutablePath(path, &size) != 0) {
 		return;
@@ -800,6 +801,15 @@ twl_remote_init(void)
 		if (row != 0) {
 			language_chosen((unsigned)row - 1);
 		}
+	});
+
+	notify_register_dispatch("twl.key.youtube", &youtube, dispatch_get_main_queue(), ^(int t) {
+		id service = ((id (*)(id, SEL))objc_msgSend)((id)objc_getClass("FBSSystemService"), sel_registerName("sharedService"));
+
+		((void (*)(id, SEL, id, id, id))objc_msgSend)(service, sel_registerName("openApplication:options:withResult:"),
+		    @"com.google.ios.youtube", nil, ^(NSError *error) {
+			say(@"the YouTube button: %@", error == nil ? @"opened" : error);
+		});
 	});
 
 	slide = (uintptr_t)_dyld_get_shared_cache_range(&length) - 0x180000000UL;

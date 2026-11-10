@@ -9,6 +9,7 @@
 #include <dispatch/dispatch.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <notify.h>
 #include <errno.h>
 
 struct hakios_touch { uint64_t time; uint32_t type, finger, x, y; };
@@ -184,6 +185,13 @@ keys_thread(void *arg)
 		}
 		if (count++ < 50) {
 			say("twl: input: key page %#x usage %#x %s\n", page, usage, t.type == HAKIOS_BUTTON_DOWN ? "down" : "up");
+		}
+		if (page == 0x0c && usage == 0x188) {
+			/* a remote's YouTube button: no key of tvOS's; PineBoard (libtwlremote) opens the application */
+			if (t.type == HAKIOS_BUTTON_DOWN) {
+				notify_post("twl.key.youtube");
+			}
+			continue;
 		}
 		e = IOHIDEventCreateKeyboardEvent(NULL, mach_absolute_time(), page, usage, t.type == HAKIOS_BUTTON_DOWN, 0);
 		IOHIDEventSetIntegerValue(e, 0x4 /* is built in */, 1);
