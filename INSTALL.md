@@ -15,8 +15,9 @@ With the stick out, the box boots Android as before.
 
 ## Build
 
-1. The kernel and the loader:
+1. The kernel (its repository goes in `hakios/`, inside this one) and the loader:
 
+       git clone https://github.com/dvg987/xnu-kernel-twilight hakios
        cd hakios && make kernel
        cd .. && twloader/build.sh
 

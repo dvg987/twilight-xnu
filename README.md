@@ -61,4 +61,4 @@ Nothing on the eMMC is written except one variable of U-Boot's environment (`boo
 | `tvos/` | What tvOS needs on this box: the libraries loaded into its programs (display, input, audio, video decoding, graphics), the build of the small root image, and notes in `tvos/docs/`. |
 | `tools/` | Building the stick, unpacking the OTA, and working with a running box. |
 | `rescue/`, `probe/` | A small Linux and a bare-metal probe for looking at the box over USB. |
-| `hakios/` | Not in this repository: the kernel, a fork of [HakiOS XNU](https://github.com/oosexgang/hakios-xnu-kernel) with this box's drivers. |
+| `hakios/` | Not in this repository: the kernel, [xnu-kernel-twilight](https://github.com/dvg987/xnu-kernel-twilight), a fork of [HakiOS XNU](https://github.com/oosexgang/hakios-xnu-kernel) with this box's drivers. It is cloned into `hakios/`. |
