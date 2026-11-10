@@ -1,0 +1,64 @@
+# twilight-xnu
+
+tvOS 16.5 on the Xiaomi Mi Box S 3rd gen (Amlogic S905X5M, board `s7d_twilight`), started from a USB stick by the
+box's own U-Boot. With the stick out, the box starts Android as before.
+
+No Apple software is distributed. You build the stick from your own copy of the tvOS 16.5 OTA for AppleTV6,2
+(20L563).
+
+| | |
+|---|---|
+| ![The home screen](docs/home.jpg) | ![Settings, About](docs/settings-about.jpg) |
+
+## What works
+
+| | |
+|---|---|
+| Graphics | OpenGL ES and Metal. |
+| Hardware video decoding | HEVC, VP9 and H.264 in 1080p and 4K. HDR10 for HEVC and VP9. |
+| Video mode switching | The output switches between SDR and HDR and between refresh rates. |
+| SDR to HDR | SDR content can be shown in an HDR video mode. |
+| Video plane | Decoded frames are sent straight to the display. |
+| Multichannel audio | E-AC-3 is decoded and sent to the TV as multichannel PCM over HDMI. |
+| Wi-Fi | Works, at the expected speed. |
+| Bluetooth | The Mi remote is paired from a setup screen; other remotes in Settings. |
+| HDMI-CEC | The TV's remote works, and tvOS can put the TV to sleep. |
+| Sleep mode | The box goes to sleep and wakes again. |
+| CPU and GPU scheduling | Scheduling and throttling for the CPU and the GPU. |
+
+Tested apps: Kodi, YouTube and Minecraft: Apple TV Edition.
+
+## Known issues
+
+- The home screen is a bit laggy. The box has a 1-core GPU, compared to the 12-core GPU of the A10X.
+- Video playing while an overlay is on top of it may be laggy, as with Apple's Aerial screensaver.
+- A playing video may glitch during its resize animation, as in YouTube when its settings open.
+
+## What will not work
+
+- FairPlay and FairPlay Streaming: protected video does not play.
+- Apple sign-in: it requires a key from the SEP of a real Apple device, which cannot be extracted.
+- AirPlay.
+- Dolby Vision: it could technically work, but has not been tested (no Dolby Vision TV was available).
+- AV1: the original Apple TV 4K only has software decoding, and apps do not expect AV1 on the box.
+
+## Install
+
+[INSTALL.md](INSTALL.md) has the whole procedure. In short:
+
+1. You need the box with an unlocked bootloader, a USB stick of 8 GB or more, and your own tvOS 16.5 OTA.
+2. Build the kernel, the loader and the tvOS system volume, then write the stick with `tools/twl-release.sh`.
+3. Put the stick in and start the box. The first start asks for a remote, if the TV's does not work over
+   HDMI-CEC, and then for the language.
+
+Nothing on the eMMC is written except one variable of U-Boot's environment (`bootcmd`).
+
+## What is here
+
+| | |
+|---|---|
+| `twloader/` | The loader U-Boot starts: it sets the box up and hands over to the kernel. |
+| `tvos/` | What tvOS needs on this box: the libraries loaded into its programs (display, input, audio, video decoding, graphics), the build of the small root image, and notes in `tvos/docs/`. |
+| `tools/` | Building the stick, unpacking the OTA, and working with a running box. |
+| `rescue/`, `probe/` | A small Linux and a bare-metal probe for looking at the box over USB. |
+| `hakios/` | Not in this repository: the kernel, a fork of [HakiOS XNU](https://github.com/oosexgang/hakios-xnu-kernel) with this box's drivers. |
