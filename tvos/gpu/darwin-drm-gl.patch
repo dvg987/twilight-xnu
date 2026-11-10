@@ -8,7 +8,72 @@
     case kIOReturnNotPermitted:
     case kIOReturnNotPrivileged: return EPERM;
     default: return EIO;
-@@ -1079,9 +1080,16 @@
+@@ -128,7 +129,7 @@
+    kern_return_t kr = IOConnectMapMemory64(g_conn, type, mach_task_self(), &addr, &len, kIOMapAnywhere | kIOMapWriteCombineCache);
+    stat_add(STAT_MAP, began);
+    if (kr != KERN_SUCCESS) {
+-      SHIM_LOG("IOConnectMapMemory64(type %#x) failed: %#x\n", type, kr);
++      fprintf(stderr, "drm_darwin: IOConnectMapMemory64(type %#x) failed: %#x\n", type, kr);
+       return NULL;
+    }
+    if (size)
+@@ -657,30 +658,34 @@
+    uint32_t type;
+    int used;
+ };
+-#define MAX_MAPPINGS 8192
++/* grown as needed: a game keeps thousands of buffer objects mapped (Minecraft's world went past 8192, a fixed size once, and
++ * Mesa's next map failed with ENOMEM) */
++#define MAX_MAPPINGS (256u * 1024)
+ static struct mapping *g_mappings;
+-static unsigned g_nmappings;
++static unsigned g_nmappings, g_capacity, g_free_hint;   /* no entry below g_free_hint is free */
+ 
+ static int mapping_add(void *addr, size_t size, uint32_t type)
+ {
+    pthread_mutex_lock(&g_lock);
+-   if (!g_mappings) {
+-      g_mappings = calloc(MAX_MAPPINGS, sizeof *g_mappings);
+-      if (!g_mappings) {
++   unsigned i = g_free_hint;
++   while (i < g_nmappings && g_mappings[i].used)
++      i++;
++   if (i == g_capacity) {
++      unsigned capacity = g_capacity ? g_capacity * 2 : 8192;
++      struct mapping *grown = capacity <= MAX_MAPPINGS ? realloc(g_mappings, capacity * sizeof *grown) : NULL;
++      if (!grown) {
+          pthread_mutex_unlock(&g_lock);
++         fprintf(stderr, "drm_darwin: the mapping table is full (%u)\n", g_capacity);
+          return -1;
+       }
+-   }
+-   unsigned i = 0;
+-   while (i < g_nmappings && g_mappings[i].used)
+-      i++;
+-   if (i == MAX_MAPPINGS) {
+-      pthread_mutex_unlock(&g_lock);
+-      return -1;
++      memset(grown + g_capacity, 0, (capacity - g_capacity) * sizeof *grown);
++      g_mappings = grown;
++      g_capacity = capacity;
+    }
+    if (i == g_nmappings)
+       g_nmappings++;
+    g_mappings[i] = (struct mapping){addr, size, type, 1};
++   g_free_hint = i + 1;
+    pthread_mutex_unlock(&g_lock);
+    return 0;
+ }
+@@ -741,6 +746,8 @@
+       if (g_mappings[i].used && g_mappings[i].addr == addr) {
+          type = g_mappings[i].type;
+          g_mappings[i].used = 0;
++         if (i < g_free_hint)
++            g_free_hint = i;
+          found = 1;
+          break;
+       }
+@@ -1079,9 +1086,16 @@
        ret = ioctl_group_submit(arg);
        break;
     case DRM_IOCTL_PANTHOR_GROUP_GET_STATE: {

@@ -132,6 +132,26 @@ on_exception(obj_t exception)
 	fsync(log_fd);
 }
 
+/* how a program that is not killed by a signal of its own ends: exit() (who called it) or a SIGTERM from outside;
+ * one that leaves no line at all was SIGKILLed (FrontBoard, the memory watchdog) */
+static void
+on_exit_here(void)
+{
+	put("\n*** exit() called\n");
+	backtrace_here();
+	fsync(log_fd);
+}
+
+static void
+on_term(int sig)
+{
+	put("\n*** signal %d (%s) from outside\n", sig, strsignal(sig));
+	backtrace_here();
+	fsync(log_fd);
+	signal(sig, SIG_DFL);
+	raise(sig);
+}
+
 __attribute__((constructor)) static void
 twl_crash_init(void)
 {
@@ -164,6 +184,8 @@ twl_crash_init(void)
 	for (unsigned i = 0; i < sizeof(sigs) / sizeof(sigs[0]); i++) {
 		sigaction(sigs[i], &sa, NULL);
 	}
+	signal(SIGTERM, on_term);
+	atexit(on_exit_here);
 	dlopen("/System/Library/Frameworks/Foundation.framework/Foundation", RTLD_NOW);
 	set_handler = (void (*)(void (*)(obj_t)))dlsym(RTLD_DEFAULT, "NSSetUncaughtExceptionHandler");
 	if (set_handler != NULL) {

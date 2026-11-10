@@ -94,3 +94,15 @@ ppe_thres[25] @74 39 1C C7 71 1C 07 00..; tx_lft u16 @100 1000; phy_bw_max @102 
 he_supp @105 1; he_ul_on @106 0; ps_on @107 1; ant_div_on @108 0; dpsm @109 1; amsdu_tx int @112 0.
 MAC: efuse words through the firmware: valid = (efuse[7] >> 17) & 1; lo, hi = valid ? efuse[0x11], efuse[0x12] :
 efuse[1], efuse[2]; MAC = hi[15:8], hi[7:0], lo[31:24], lo[23:16], lo[15:8], lo[7:0]; byte0 &= 0xFC.
+
+## Throughput (2026-11-08: 12 -> ~150 Mbit/s down, 3 -> ~170 up, 5 GHz ch 36)
+- xHCI completions polled every 4 us (kern.hakios_xhci_poll_us), not 250 us: every exchange is 2-3 transfers.
+- The poll thread only sleeps (kern.hakios_w2_idle_ms) after a look that moved nothing.
+- Data in/out of the DMA block through a write-combined mapping (ml_io_map_wcomb) with memcpy, not word by word
+  through the device mapping.
+- TX: frames go into a batch; the "w2 tx" thread sends up to 25 pages / 64 KiB per packet command.
+- Buffer handshake done as Amlogic does: on TX_STOP stop sending and tell the firmware (ext {3, 1}) only once every
+  page is back; NARROW/EXPAND in the RX head answered with READ then DONE flags in the confirmation (the head can
+  still show the request after DONE: the page count only changes when the layout does). Ignoring it made the firmware
+  report an error and drop the link under upload.
+- Measure: tools/twl-net.py down|up (tvos/src/twlnet.c in /var/tmp), work/w2-net.sh with kern.hakios_w2_stats=1.

@@ -100,8 +100,11 @@ main(int argc, char **argv)
 		decoded++;
 		CC_MD5_CTX ctx;
 		CC_MD5_Init(&ctx);
-		for (unsigned y = 0; y < stream.height; y++) CC_MD5_Update(&ctx, frame + (size_t)y * stream.stride, stream.width);
-		for (unsigned y = 0; y < stream.height / 2; y++)
+		/* HEVCPROBE_HEIGHT=N: the cropped height the references have (the kernel names the coded one) */
+		unsigned rows = getenv("HEVCPROBE_HEIGHT") ? (unsigned)atoi(getenv("HEVCPROBE_HEIGHT")) : stream.height;
+		if (rows == 0 || rows > stream.height) rows = stream.height;
+		for (unsigned y = 0; y < rows; y++) CC_MD5_Update(&ctx, frame + (size_t)y * stream.stride, stream.width);
+		for (unsigned y = 0; y < rows / 2; y++)
 			CC_MD5_Update(&ctx, frame + (size_t)stream.stride * stream.rows + (size_t)y * stream.stride, stream.width);
 		unsigned char digest[16];
 		char hex[33];

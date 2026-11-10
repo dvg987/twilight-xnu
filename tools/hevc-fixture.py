@@ -94,7 +94,7 @@ def main():
     # FFmpeg's decode as raw planes; 10-bit rounded to 8 bits ((v + 2) >> 2, at most 255), as the decoder's 8-bit
     # double write does
     width, height = int(stream['width']), int(stream['height'])
-    raw = subprocess.run(['ffmpeg', '-v', 'error', '-i', cut, '-f', 'rawvideo',
+    raw = subprocess.run(['ffmpeg', '-v', 'error', '-i', cut, '-fps_mode', 'passthrough', '-f', 'rawvideo',
                           '-pix_fmt', 'yuv420p' if depth == 8 else 'yuv420p10le', '-'],
                          check=True, stdout=subprocess.PIPE).stdout
     os.unlink(cut)

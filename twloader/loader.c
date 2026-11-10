@@ -129,6 +129,7 @@ struct platform {
 	int cores, core_shift, monitor;
 	u64 osd_fb;                     /* != 0: reprogram the Amlogic OSD1 to scan 32-bit ARGB from here */
 	struct range fixed[6];          /* RAM that is never the kernel's */
+	struct range holes[6];          /* RAM ours that the kernel's window may span: named to the kernel (twl_holes=), which leaves it alone */
 	u64 mbox;                       /* 0: the top 16 MB of RAM */
 };
 
@@ -141,11 +142,15 @@ static const struct platform platforms[] = {
 		.cores = 4, .core_shift = 8, .monitor = 1,
 		.fixed = {
 			{ 0x00000000, 0x07500000 },     /* U-Boot's own, the secure monitor and TEE, ramoops */
-			{ 0x1f800000, 0x00800000 },     /* U-Boot's framebuffer (16 bits, too small for 32) */
+			{ 0x7f000000, 0x01000000 },     /* the secure world's at the top */
+		},
+		/* Where the rescue Linux finds them after a run (tools/twl-log.py, twl-shot.py): the kernel's window spans them, so that
+		 * it is the 1.8 GB from 0x08000000 up and not the largest stretch between them (1248 MB) */
+		.holes = {
+			{ 0x1f800000, 0x00800000 },     /* U-Boot's framebuffer (16 bits, too small for 32), still where it was */
 			{ 0x6e000000, 0x01000000 },     /* ours: 1920x1080, 32 bits */
 			{ 0x6f000000, 0x01000000 },     /* the mailbox */
-			{ 0x70000000, 0x0f000000 },     /* the last frame, saved on the way back, and the monitor's time-lapse */
-			{ 0x7f000000, 0x01000000 },     /* the secure world's at the top */
+			{ 0x70000000, 0x05800000 },     /* the last frame, saved on the way back, and the monitor's time-lapse (SHOT_SLOTS) */
 		},
 		.mbox = 0x6f000000,
 	},
@@ -584,6 +589,44 @@ take(u64 base, u64 size)
 		taken[ntaken].size = size;
 		ntaken++;
 	}
+}
+
+#define CANARY_XOR 0x5a5aa5a5c3c33c3cULL
+
+static int
+overlaps(u64 a0, u64 a1, u64 b0, u64 b1)
+{
+	return a0 < b1 && b0 < a1;
+}
+
+/* the range lies wholly inside one of the platform's holes */
+static int
+in_holes(u64 base, u64 size)
+{
+	for (int i = 0; P != NULL && i < 6 && P->holes[i].size != 0; i++) {
+		if (base >= P->holes[i].base && base + size <= P->holes[i].base + P->holes[i].size) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+/* "0x" and the number in hex, for the command line */
+static void
+hex_str(char *out, u64 v)
+{
+	char tmp[17];
+	int n = 0;
+	do {
+		tmp[n++] = "0123456789abcdef"[v & 15];
+		v >>= 4;
+	} while (v != 0);
+	*out++ = '0';
+	*out++ = 'x';
+	while (n > 0) {
+		*out++ = tmp[--n];
+	}
+	*out = '\0';
 }
 
 static int
@@ -1155,22 +1198,65 @@ twl_main(u64 fdt_pa, u64 image_base)
 	for (int i = 0; i < 6; i++) {
 		take(P->fixed[i].base, P->fixed[i].size);
 	}
-	take(mbox, MBOX_SIZE);
+	int spans = P->holes[0].size != 0;      /* the window may cover the holes, the payload and the FDT (checked below) */
+	if (!in_holes(mbox, MBOX_SIZE)) {
+		take(mbox, MBOX_SIZE);
+	}
 	if (P->fb == 0 && P->uart != 0) {
 		/* QEMU: ramfb in the 16 MB below the mailbox */
 		ramfb_setup(mbox - 0x1000000ULL);
 		take(mbox - 0x1000000ULL, 0x1000000ULL);
 	}
-	take(image_base & ~0xfffULL, (u64)(_image_end - _start) + 0x2000);
-	take(rd_start & ~0xfffULL, rd_end - (rd_start & ~0xfffULL) + 0x1000);
-	if (fdt_pa) {
-		take(fdt_pa & ~0xfffULL, (u64)f.size + 0x2000);
+	take(image_base & ~0xfffULL, (u64)(_image_end - _start) + 0x2000);   /* (the monitor runs from it all along) */
+	/* twl_win_lo_mb= / twl_win_hi_mb=: the window only above / below that many MB (to try a part of RAM on its own) */
+	u64 win_lo = cmdline_number(pl.cmdline, "twl_win_lo_mb=", 0) << 20, win_hi = cmdline_number(pl.cmdline, "twl_win_hi_mb=", 0) << 20;
+	if (win_lo > ram_base) {
+		take(ram_base, win_lo - ram_base);
+	}
+	if (win_hi != 0 && win_hi < ram_base + ram_size) {
+		take(win_hi, ram_base + ram_size - win_hi);
+	}
+	if (!spans) {
+		take(rd_start & ~0xfffULL, rd_end - (rd_start & ~0xfffULL) + 0x1000);
+		if (fdt_pa) {
+			take(fdt_pa & ~0xfffULL, (u64)f.size + 0x2000);
+		}
 	}
 	u64 phys_base, win_size;
 	if (!choose_window(&phys_base, &win_size)) {
 		fail("no stretch of RAM big enough");
 	}
 	print("kernel window %x..%x (%d MB)\n", phys_base, phys_base + win_size, win_size >> 20);
+	/* the holes inside it, adjacent ones as one, for the kernel's twl_holes= */
+	struct range wh[6];
+	int nwh = 0;
+	u64 hole_bytes = 0;
+	for (int i = 0; i < 6 && P->holes[i].size != 0; i++) {
+		u64 b = P->holes[i].base, e = b + P->holes[i].size;
+		if (b < phys_base) {
+			b = phys_base;
+		}
+		if (e > phys_base + win_size) {
+			e = phys_base + win_size;
+		}
+		if (e <= b) {
+			continue;
+		}
+		if (nwh > 0 && wh[nwh - 1].base + wh[nwh - 1].size == b) {
+			wh[nwh - 1].size += e - b;
+		} else {
+			wh[nwh].base = b;
+			wh[nwh].size = e - b;
+			nwh++;
+		}
+		hole_bytes += e - b;
+	}
+	for (int i = 0; i < nwh; i++) {
+		print("  hole %x..%x (%d MB): ours, the kernel leaves it alone\n", wh[i].base, wh[i].base + wh[i].size, wh[i].size >> 20);
+	}
+	if (nwh > 0) {
+		print("  the kernel's: %d MB\n", (win_size - hole_bytes) >> 20);
+	}
 
 	/* --- the kernel ---------------------------------------------------- */
 	const struct mach_header_64 *mh = (const struct mach_header_64 *)pl.kernel;
@@ -1209,6 +1295,37 @@ twl_main(u64 fdt_pa, u64 image_base)
 	u64 pram_pa = ba_pa + PAGE_SIZE_MAX, top = pram_pa + PANIC_LOG_SIZE;
 	if (top - phys_base + 0x4000000ULL > win_size) {
 		fail("the kernel and its RAM disk do not fit");
+	}
+	/* what is copied to the window's start must not land on a hole, nor on the payload or the FDT it is copied from */
+	if (spans) {
+		for (int i = 0; i < nwh; i++) {
+			if (overlaps(kern_lo, top, wh[i].base, wh[i].base + wh[i].size)) {
+				fail("the kernel's data would land on a hole");
+			}
+		}
+		if (overlaps(kern_lo, top, rd_start, rd_end) || (fdt_pa && overlaps(kern_lo, top, fdt_pa, fdt_pa + f.size))) {
+			fail("the kernel's data would land on the payload or the FDT");
+		}
+	}
+	/* twl_canary=1 (an experiment): the RAM from the kernel's data up to the first hole is a hole too, filled with a pattern
+	 * (each word its own address ^ CANARY_XOR) after everything is copied, and named in twl_canary=: the kernel watches it for
+	 * writes nobody of its own makes */
+	u64 canary_lo = 0, canary_hi = 0;
+	if (spans && nwh > 0 && cmdline_has(pl.cmdline, "twl_canary=1")) {
+		/* (twl_canary_skip_mb=, default 160: the kernel's first allocations, before its VM runs, are taken straight from above its data) */
+		canary_lo = (top + (cmdline_number(pl.cmdline, "twl_canary_skip_mb=", 160) << 20) + 0x200000ULL - 1) & ~(0x200000ULL - 1);
+		canary_hi = wh[0].base;
+		if (canary_hi > canary_lo && nwh < 6) {
+			for (int i = nwh; i > 0; i--) {
+				wh[i] = wh[i - 1];
+			}
+			wh[0].base = canary_lo;
+			wh[0].size = canary_hi - canary_lo;
+			nwh++;
+			print("  canary %x..%x (%d MB): a hole filled with a pattern\n", canary_lo, canary_hi, (canary_hi - canary_lo) >> 20);
+		} else {
+			canary_lo = canary_hi = 0;
+		}
 	}
 	lc = (const struct load_command *)(mh + 1);
 	for (u32 i = 0; i < mh->ncmds; i++, lc = (const void *)((const u8 *)lc + lc->cmdsize)) {
@@ -1275,6 +1392,29 @@ twl_main(u64 fdt_pa, u64 image_base)
 	if (pl.version != NULL && str_len(pl.version) < 64) {
 		line_add(&l, "hakios_kver=");
 		line_add(&l, pl.version);
+		line_add(&l, " ");
+	}
+	if (nwh > 0) {
+		line_add(&l, "twl_holes=");
+		for (int i = 0; i < nwh; i++) {
+			char num[40];
+			hex_str(num, wh[i].base);
+			line_add(&l, i ? "," : "");
+			line_add(&l, num);
+			line_add(&l, "+");
+			hex_str(num, wh[i].size);
+			line_add(&l, num);
+		}
+		line_add(&l, " ");
+	}
+	if (canary_hi != 0) {
+		char num[40];
+		line_add(&l, "twl_canary_range=");
+		hex_str(num, canary_lo);
+		line_add(&l, num);
+		line_add(&l, "+");
+		hex_str(num, canary_hi - canary_lo);
+		line_add(&l, num);
 		line_add(&l, " ");
 	}
 	line_add(&l, pl.cmdline);
@@ -1363,16 +1503,17 @@ twl_main(u64 fdt_pa, u64 image_base)
 	dt_prop(&w, "reg", pram_reg, sizeof(pram_reg));
 	dt_end(&w);
 
-	/* the cores: this one first, then the others but the monitor's */
+	/* the cores: this one first, then the others but the monitor's (when there is one: twl_monitor=0 leaves it to the kernel too) */
 	u64 self = read_mpidr() & 0xffffff;
 	int ncpus = 0;
+	int monitor_core = P->monitor && !cmdline_has(pl.cmdline, "twl_monitor=0");
 	dt_begin(&w, "cpus");
 	for (int pass = 0; pass < 2; pass++) {
 		for (int core = 0; core < P->cores; core++) {
 			u64 mpidr = (u64)core << P->core_shift;
 			char name[5] = { 'c', 'p', 'u', (char)('0' + ncpus), 0 };
 
-			if ((pass == 0) != (mpidr == self) || (P->monitor && core == P->cores - 1)) {
+			if ((pass == 0) != (mpidr == self) || (monitor_core && core == P->cores - 1)) {
 				continue;
 			}
 			dt_begin(&w, name);
@@ -1432,6 +1573,12 @@ twl_main(u64 fdt_pa, u64 image_base)
 	MB->shot_from = cmdline_number(pl.cmdline, "twl_shot_from=", 0);
 	if (P->monitor && !cmdline_has(pl.cmdline, "twl_monitor=0")) {
 		start_monitor();
+	}
+	if (canary_hi != 0) {
+		/* the payload and the FDT are read by now (the kernel, its RAM disks and the device tree are where they belong) */
+		for (volatile u64 *q = (volatile u64 *)canary_lo; q < (volatile u64 *)canary_hi; q++) {
+			*q = (u64)q ^ CANARY_XOR;
+		}
 	}
 	print("jumping to %x\n", entry_va + slide);
 	MB->t_kernel = read_cntpct();

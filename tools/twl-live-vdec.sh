@@ -7,7 +7,7 @@ VDEC=1 GLAPPS="Kodi minecraftappletv YouTubeUnstable" \
 TVLIBS="twlhook:backboardd twlload:backboardd,mediaserverd,YouTubeUnstable,PineBoard,IdleScreen twlpb:PineBoard twlbt:TVSettings twlcrash:Kodi,minecraftappletv twlpad:minecraftappletv twlcloud:minecraftappletv twlpbdiag:PineBoard" \
 VAR=1 SSH=1 CPUS=4 SECS=86400 KEYS=work/keys-none.list REST=1 TVAUDIO=1 \
 OSLOG="com.apple.wifid com.apple.Pineboard com.apple.bluetooth com.apple.mediaserverd" \
-ARGS="fbwidth=1920 fbheight=1080 usbkeys=1 cec=1 w2=6 w2bt=3 twl_monitor=0 hdmitx=1 mali=8 metal=1 gles=1 mali-pool=192 fb_flip=1 hdmiaudio=3 mali-clients=* msgbuf=4194304 ${EXTRA_ARGS-}" \
+ARGS="fbwidth=1920 fbheight=1080 usbkeys=1 cec=1 w2=6 w2bt=3 twl_monitor=0 hdmitx=1 mali=8 metal=1 gles=1 mali-pool=192 fb_flip=1 hdmiaudio=3 amlcpu=1 mali-clients=* msgbuf=4194304 ${EXTRA_ARGS-}" \
 bash tvos/build.sh > logs/tvos-vdec-build.log 2>&1 || { tail -20 logs/tvos-vdec-build.log; exit 1; }
 python3 tools/mkbootimg.py --kernel twloader/twloader.Image --ramdisk out/payload-tvos.bin --kernel-offset 0x2000000 \
 	--cmdline twloader -o out/twl-live-vdec.img | tail -1

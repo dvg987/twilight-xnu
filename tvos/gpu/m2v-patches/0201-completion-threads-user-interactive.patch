@@ -1,0 +1,20 @@
+--- a/crates/metal2vulkan-runtime/src/exit_guard.rs	2026-11-06 12:36:23.640828960 -0300
++++ b/crates/metal2vulkan-runtime/src/exit_guard.rs	2026-11-06 12:36:23.641619659 -0300
+@@ -782,7 +782,7 @@
+ 
+ /// Run this thread at the user-interactive quality of service, whatever its class: a thread of
+ /// the runtime's own that takes command buffers to their handlers ([`spawn_user_interactive`]).
+-#[cfg(target_os = "macos")]
++#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+ fn run_at_user_interactive() {
+     // Metal runs every command buffer's scheduled and completed handlers at the user-interactive
+     // class, whatever the class of the thread that committed it: measured on an M3 Max, macOS
+@@ -903,7 +903,7 @@
+ }
+ 
+ /// Nothing: no such hint here ([`run_at_user_interactive`] on macOS and Linux).
+-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
++#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos", target_os = "linux")))]
+ fn run_at_user_interactive() {}
+ 
+ /// Whether this thread runs at the user-initiated quality of service or above: its class is

@@ -65,7 +65,11 @@ struct decoder {
     uint32_t token_slot, token_generation;
     bool token, plane_only;   /* debug log: the kernel's decode, and the copy into the pixel buffer */
     bool quarter;             /* VP9 above 1440p for a player that names no size: copies a quarter each way (TWL_VP9_QUARTER) */
-    bool sized;               /* the player names a picture size (Kodi): it draws the pixel buffers itself, never skip a copy */
+    bool sized;               /* the player names a picture size (Kodi) */
+    unsigned skipped_nals;    /* HEVC NAL units of the unspecified types left out (Dolby Vision's) */
+    OSType packed10;          /* 'p420'/'pf20' when the client takes only Apple's packed 10-bit 4:2:0 (tvOS's screensaver);
+                               * its copies are always made: an empty one (left so while the plane showed the pictures)
+                               * was a fullscreen green frame as the screensaver went away */
     struct twl_h264_dpb *dpb;
     /* HEVC sessions (the kernel's TWL_VDEC_HEVC): their DPB, and whether the kernel has their pictures' layout */
     bool hevc, hevc_capable, hevc_stream;
@@ -336,12 +340,37 @@ start_session_locked(void *object, void *session, CMVideoFormatDescriptionRef fo
      * (AVSampleBufferDisplayLayer's, which show the plane's full picture) keep the small buffers. */
     bool doubled = scale == 2 && (asked_w > d->out_width || asked_h > d->out_height);
     unsigned asked_format = 0;
+    d->packed10 = 0;
     if (destination) {
         CFTypeRef f = CFDictionaryGetValue(destination, kCVPixelBufferPixelFormatTypeKey);
-        if (f && CFGetTypeID(f) == CFNumberGetTypeID()) CFNumberGetValue(f, kCFNumberIntType, &asked_format);
-        else if (f && CFGetTypeID(f) == CFArrayGetTypeID() && CFArrayGetCount(f) > 0) {
+        if (f && CFGetTypeID(f) == CFNumberGetTypeID()) {
+            CFNumberGetValue(f, kCFNumberIntType, &asked_format);
+            d->packed10 = asked_format == 'p420' || asked_format == 'pf20' ? asked_format : 0;
+        } else if (f && CFGetTypeID(f) == CFArrayGetTypeID() && CFArrayGetCount(f) > 0) {
             CFNumberRef n = CFArrayGetValueAtIndex(f, 0);
             if (CFGetTypeID(n) == CFNumberGetTypeID()) CFNumberGetValue(n, kCFNumberIntType, &asked_format);
+            /* (diagnosis: every format the client would take, in its order) */
+            char list[160] = "";
+            for (CFIndex k = 0; k < CFArrayGetCount(f) && k < 24; k++) {
+                unsigned v = 0;
+                CFNumberRef e = CFArrayGetValueAtIndex(f, k);
+                if (CFGetTypeID(e) == CFNumberGetTypeID()) CFNumberGetValue(e, kCFNumberIntType, &v);
+                size_t at = strlen(list);
+                snprintf(list + at, sizeof(list) - at, v > 0xffffff ? " %c%c%c%c" : " %u", v >> 24, v >> 16 & 0xff, v >> 8 & 0xff, v & 0xff);
+            }
+            debug("the client takes:%s\n", list);
+            /* a client that takes no 8-bit 4:2:0 and does take the packed 10-bit one gets that (VideoToolbox's own
+             * conversion to it gave the screensaver nothing: every picture was dropped and the screen stayed black) */
+            bool eight = false;
+            OSType packed = 0;
+            for (CFIndex k = 0; k < CFArrayGetCount(f); k++) {
+                unsigned v = 0;
+                CFNumberRef e = CFArrayGetValueAtIndex(f, k);
+                if (CFGetTypeID(e) == CFNumberGetTypeID()) CFNumberGetValue(e, kCFNumberIntType, &v);
+                if (v == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange || v == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) eight = true;
+                if (!packed && (v == 'p420' || v == 'pf20')) packed = v;
+            }
+            d->packed10 = eight ? 0 : packed;
         }
     }
     CFTypeRef transfer = CMFormatDescriptionGetExtension(format, kCVImageBufferTransferFunctionKey);
@@ -416,8 +445,11 @@ described:
         return kVTAllocationFailedErr;
     }
     CFTypeRef full_range = CMFormatDescriptionGetExtension(format, kCMFormatDescriptionExtension_FullRangeVideo);
-    OSType pixel_format = full_range == kCFBooleanTrue ? kCVPixelFormatType_420YpCbCr8BiPlanarFullRange :
+    if (d->pix_width != d->out_width) d->packed10 = 0;      /* (the doubled copy is 8-bit only) */
+    OSType pixel_format = d->packed10 ? d->packed10 : full_range == kCFBooleanTrue ? kCVPixelFormatType_420YpCbCr8BiPlanarFullRange :
         kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+    if (d->packed10) debug("pictures as '%c%c%c%c' (packed 10-bit)\n", d->packed10 >> 24, d->packed10 >> 16 & 0xff,
+        d->packed10 >> 8 & 0xff, d->packed10 & 0xff);
     number(attributes, kCVPixelBufferPixelFormatTypeKey, pixel_format);
     number(attributes, kCVPixelBufferWidthKey, (int)d->pix_width);
     number(attributes, kCVPixelBufferHeightKey, (int)d->pix_height);
@@ -473,7 +505,7 @@ decode_reference_picture(struct decoder *d, const uint8_t *packet, size_t size, 
     }
     twl_h264_dpb_set_held(d->dpb, stream.held, stream.showing);
     /* while the video plane shows this decoder's pictures, nobody needs their pixels (twlcvgl.c) */
-    d->plane_only = stream.plane != 0 && !d->sized;
+    d->plane_only = stream.plane != 0 && !d->packed10;
     if (stream.stride != d->stride || stream.rows != d->rows) {
         debug("kernel frame %ux%u (stride %u, rows %u) is not the session's (stride %u, rows %u)\n", stream.width,
             stream.height, stream.stride, stream.rows, d->stride, d->rows);
@@ -536,7 +568,7 @@ decode_hevc_picture(struct decoder *d, const uint8_t *packet, size_t size, uint8
         d->hevc_stream = true;
     }
     twl_hevc_dpb_set_held(d->hdpb, stream.held, stream.showing);
-    d->plane_only = stream.plane != 0 && !d->sized;
+    d->plane_only = stream.plane != 0 && !d->packed10;
     /* a player that says nothing of the transfer function (Kodi) gets the bitstream's: PQ in the VUI is HDR10 (and Dolby
      * Vision 8.1's base layer), and the plane sends it as such */
     if (!d->pq && stream.transfer == 16) {
@@ -601,7 +633,7 @@ decode_vp9_packet(struct decoder *d, const uint8_t *packet, size_t size, uint8_t
         struct twl_vdec_stream stream;
         if (d->vp9_stream && ioctl(d->fd, TWL_VDEC_STREAM, &stream) == 0) {
             twl_vp9_dpb_set_held(d->vdpb, stream.held, stream.showing);
-            d->plane_only = stream.plane != 0 && !d->sized;
+            d->plane_only = stream.plane != 0 && !d->packed10;
         }
         struct twl_vp9_frame f;
         bool frame_shown;
@@ -696,6 +728,13 @@ decode_frame_now(void *object, void *frame, CMSampleBufferRef sample, VTDecodeFr
         if (!n || n > size - at || used > PACKET_MAX - 4 || n > PACKET_MAX - used - 4) {
             status = kVTVideoDecoderBadDataErr; goto done;
         }
+        /* HEVC's unspecified NAL types (48-63: Dolby Vision's RPU 62 and enhancement layer 63) are not for the core: fed to
+         * it with a DV profile 8.1 file, the tops of pictures came out as coloured lines now and then (Kodi) */
+        if (d->hevc && ((source[at] >> 1) & 0x3f) >= 48) {
+            d->skipped_nals++;
+            at += n;
+            continue;
+        }
         memcpy(packet + used, "\0\0\0\1", 4); used += 4;
         memcpy(packet + used, source + at, n); used += n; at += n;
     }
@@ -723,10 +762,13 @@ decoded_picture:;
     status = pool ? CVPixelBufferPoolCreatePixelBuffer(NULL, pool, &pixel) : kVTAllocationFailedErr;
     if (status) goto done;
     unsigned row_bytes = (d->pix_width + 1) & ~1u, chroma_rows = (d->pix_height + 1) / 2;
+    /* packed 10-bit: three samples to a 32-bit word, luma and the interleaved Cb Cr alike */
+    size_t luma_need = d->packed10 ? (d->pix_width + 2) / 3 * 4 : d->pix_width;
+    size_t chroma_need = d->packed10 ? (row_bytes + 2) / 3 * 4 : row_bytes;
     if (CVPixelBufferGetPlaneCount(pixel) != 2 || CVPixelBufferGetWidthOfPlane(pixel, 0) != d->pix_width ||
         CVPixelBufferGetHeightOfPlane(pixel, 0) != d->pix_height || CVPixelBufferGetHeightOfPlane(pixel, 1) != chroma_rows ||
-        CVPixelBufferGetBytesPerRowOfPlane(pixel, 0) < d->pix_width ||
-        CVPixelBufferGetBytesPerRowOfPlane(pixel, 1) < row_bytes) {
+        CVPixelBufferGetBytesPerRowOfPlane(pixel, 0) < luma_need ||
+        CVPixelBufferGetBytesPerRowOfPlane(pixel, 1) < chroma_need) {
         status = kVTVideoDecoderMalfunctionErr; goto done;
     }
     IOSurfaceRef surface = CVPixelBufferGetIOSurface(pixel);
@@ -755,7 +797,19 @@ decoded_picture:;
         /* the kernel's frame: luma stride x rows, then interleaved chroma, cropped to what is shown */
         unsigned rows = plane ? chroma_rows : d->pix_height, bytes_per_row = plane ? row_bytes : d->pix_width;
         const uint8_t *bytes = output + (plane ? (size_t)d->stride * d->rows : 0);
-        if (d->pix_width == d->out_width) {
+        if (d->packed10) {
+            /* each 8-bit sample (the kernel's copy is the 10-bit picture rounded) to 10 bits, three to a little-endian
+             * word: bits 0-9, 10-19, 20-29 */
+            for (unsigned row = 0; row < rows; row++) {
+                const uint8_t *from = bytes + (size_t)row * d->stride;
+                uint32_t *to = (uint32_t *)(base + row * stride);
+                unsigned k = 0;
+                for (; k + 3 <= bytes_per_row; k += 3)
+                    *to++ = (uint32_t)from[k] << 2 | (uint32_t)from[k + 1] << 12 | (uint32_t)from[k + 2] << 22;
+                if (k < bytes_per_row)
+                    *to = (uint32_t)from[k] << 2 | (k + 1 < bytes_per_row ? (uint32_t)from[k + 1] << 12 : 0);
+            }
+        } else if (d->pix_width == d->out_width) {
             for (unsigned row = 0; row < rows; row++)
                 memcpy(base + row * stride, bytes + (size_t)row * d->stride, bytes_per_row);
         } else {
@@ -786,8 +840,8 @@ copied:
         if (d->hevc && d->hdpb) {
             unsigned picks, forced, used, held;
             twl_hevc_dpb_stats(d->hdpb, &picks, &forced, &used, &held);
-            debug("HEVC slots: %u of %u pictures into a held slot (then on average %u slots the DPB's, %u held)\n", forced,
-                picks, used, held);
+            debug("HEVC slots: %u of %u pictures into a held slot (then on average %u slots the DPB's, %u held); %u NAL units "
+                "of types 48-63 left out\n", forced, picks, used, held, d->skipped_nals);
         }
     }
 done:

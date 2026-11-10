@@ -190,6 +190,11 @@ echo "tvOS on twilight: image built $(date '+%Y-%m-%d %H:%M')" > $O/root/etc/mot
 # the job that runs etc/rc.jobs once launchd is up
 cp $H/com.hakios.demo.plist $O/root/LaunchDaemons/
 ALLOW="bluetooth BTServer ${ALLOW:-}" OSLOG=${OSLOG-com.apple.backboardd} python3 $H/mkjobs.py ${REST:+--rest} $ROOTFS $O/root/LaunchDaemons $JOBS
+# fairplayd.T2 cannot run on this box: launchd starts it on demand, it exits at once without answering, and every
+# FairPlay request (AppleMediaServices signs the store's) then waits for ever -- itunesstored, accountsd and
+# amsaccountsd hung, and with them Settings > Users and Accounts and Settings > Apps. Without the job the lookup fails
+# and they go on. (FAIRPLAY=1 keeps it.)
+[ -n "${FAIRPLAY:-}" ] || rm -f $O/root/LaunchDaemons/com.apple.fairplayd.T2.plist
 # Darwin's Bluetooth on the W2 (w2bt=3): BlueTool is our stand-in (the kernel boots the controller), and bluetoothd
 # takes the UART's plain kernel control (com.apple.uart.bluetooth), not the Skywalk one it would by default
 python3 - $O/root/LaunchDaemons <<'PY'

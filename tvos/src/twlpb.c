@@ -140,12 +140,83 @@ did_update_readiness(obj_t self, SEL selector, obj_t view, bool ready)
 	update_deferral_target(self, NULL);
 }
 
-/* -[SSDisplay setState:completion:]: the completion takes (BOOL succeeded, NSError *error) */
+/*
+ * -[SSDisplay setState:completion:]: the completion takes (BOOL succeeded, NSError *error). State 2 is the display on
+ * (as at boot); any other, asleep: the kernel then tells the TV to stand by over CEC and turns the HDMI output off, and
+ * on the way back turns it on and wakes the TV (and has it show this input) -- kern.hakios_hdmitx_sleep.
+ */
+static int asleep;      /* (awake at boot: the first call, state 2, changes nothing -- no mode set again, no CEC) */
+
+/* PineBoard's power manager, to sleep or wake the system as the remote's button does */
+static void
+power(bool wake, CFStringRef reason)
+{
+	obj_t cls = (obj_t)objc_getClass("PBPowerManager"), pm = NULL;
+	static const char *const getters[] = { "sharedInstance", "sharedManager", "sharedPowerManager", NULL };
+
+	for (unsigned i = 0; cls && !pm && getters[i]; i++)
+		if (class_getClassMethod((Class)cls, sel_registerName(getters[i])) != NULL) pm = SEND0(obj_t, cls, getters[i]);
+	/* (a completion it calls: with none the wake crashed PineBoard, which started again in its fallback 1080p mode) */
+	void (^done)(bool, void *) = ^(bool ok, void *error) { (void)error; say("twl: %s: %s\n", wake ? "woke" : "slept", ok ? "done" : "failed"); };
+	say("twl: %s (%s): power manager %p\n", wake ? "wake" : "sleep", CFStringGetCStringPtr(reason, kCFStringEncodingUTF8), pm);
+	if (pm != NULL)
+		((void (*)(obj_t, SEL, obj_t, void *))objc_msgSend)(pm, sel_registerName(wake ? "wakeSystemWithReason:completion:" :
+		    "sleepSystemWithReason:completion:"), (obj_t)reason, (void *)done);
+}
+
+/* while asleep, twice a second: has the TV asked for this box over CEC (its remote turned it on to this input)? */
+static void
+check_cec_wake(void *unused)
+{
+	int v = 0;
+	size_t size = sizeof(v);
+
+	(void)unused;
+	if (!asleep || sysctlbyname("kern.hakios_hdmitx_wake", &v, &size, NULL, 0) != 0 || v == 0) {
+		return;
+	}
+	v = 0;
+	(void)sysctlbyname("kern.hakios_hdmitx_wake", NULL, NULL, &v, sizeof(v));
+	power(true, CFSTR("Wake:CEC"));
+}
+
+/*
+ * PineBoard blanks the window server's display as tvOS goes to sleep (BKSDisplayServicesSetScreenBlanked) and waits for
+ * the display to say it is on before it unblanks it -- Apple's HDMI controller, which this box has not got: woken (by the
+ * TV's remote over CEC), the TV showed a black screen and the window server drew nothing. Unblanked here once the
+ * display is on again (BackBoardServices' function, found at run time).
+ */
+static void
+unblank_screen(void)
+{
+	void (*set_blanked)(bool) = (void (*)(bool))dlsym(RTLD_DEFAULT, "BKSDisplayServicesSetScreenBlanked");
+
+	say("twl: awake: screen unblanked%s\n", set_blanked ? "" : " (no BKSDisplayServicesSetScreenBlanked)");
+	if (set_blanked != NULL) {
+		set_blanked(false);
+	}
+}
+
 static void
 ss_display_set_state(void *self, SEL selector, long state, void (^completion)(bool, void *))
 {
+	int sleep = state != 2;
+
 	(void)self, (void)selector;
-	say("twl: SSDisplay setState %ld: done (no HDMI controller here)\n", state);
+	if (sleep != asleep) {
+		int r = sysctlbyname("kern.hakios_hdmitx_sleep", NULL, NULL, &sleep, sizeof(sleep));
+		say("twl: SSDisplay setState %ld: %s (%s)\n", state, sleep ? "asleep: TV to standby, output off" :
+		    "awake: output on, TV woken", r == 0 ? "done" : "the kernel refused");
+		if (!sleep && asleep) {
+			/* (after PineBoard's own reaction to the state: the display unblanked) */
+			dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC / 2), dispatch_get_main_queue(), ^{
+				unblank_screen();
+			});
+		}
+		asleep = sleep;
+	} else {
+		say("twl: SSDisplay setState %ld: as it was\n", state);
+	}
 	if (completion != NULL) {
 		void (^done)(bool, void *) = (void (^)(bool, void *))_Block_copy(completion);
 
@@ -176,6 +247,12 @@ recheck_deferrals(void *unused)
 	if (manager != NULL && *manager != NULL) {
 		SEND0(void, *manager, "_updateFocusDeferralsIfNeeded");
 	}
+	/* (tests: touch /var/mobile/twl/sleep-now or wake-now: PineBoard's own sleep or wake, as the remote's Sleep does) */
+	bool sleep_now = access("/var/mobile/twl/sleep-now", F_OK) == 0, wake_now = access("/var/mobile/twl/wake-now", F_OK) == 0;
+	if (sleep_now || wake_now) {
+		unlink(sleep_now ? "/var/mobile/twl/sleep-now" : "/var/mobile/twl/wake-now");
+		power(wake_now, CFSTR("twl"));
+	}
 }
 
 static void
@@ -187,6 +264,10 @@ start_rechecks(void)
 	    NSEC_PER_SEC / 10);
 	dispatch_source_set_event_handler_f(timer, recheck_deferrals);
 	dispatch_resume(timer);
+	dispatch_source_t cec = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+	dispatch_source_set_timer(cec, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), NSEC_PER_SEC / 2, NSEC_PER_SEC / 10);
+	dispatch_source_set_event_handler_f(cec, check_cec_wake);
+	dispatch_resume(cec);
 }
 
 /*
@@ -429,7 +510,7 @@ trace_selector(const char *image, const char *selector, IMP replacement)
  * and match content, with its arguments and answer. arm64 passes integers and pointers in x2.. and doubles in d0..
  * apart, so one hook of (x2, x3, x4, d0, d1) passes any mix of up to three of each through unchanged.)
  */
-#define MODE_HOOKS 96
+#define MODE_HOOKS 400
 static struct { Class cls; SEL sel; IMP original; char types[64]; unsigned told; } mode_hooks[MODE_HOOKS];
 static unsigned mode_hook_count;
 
@@ -512,7 +593,8 @@ static void
 trace_modes(const char *image)
 {
 	static const char *const words[] = { "rameRate", "atchContent", "DisplayMode", "isplayCriteria", "RefreshRate",
-	    "DynamicRange", "dynamicRange", NULL };
+	    "DynamicRange", "dynamicRange", "lank", "leepSystem", "akeSystem", "acklight", "DisplayState", "displayState",
+	    "isplayPower", "creenOn", "isplayOn", NULL };
 	unsigned count = 0;
 	const char **names = objc_copyClassNamesForImage(image, &count);
 
@@ -529,6 +611,7 @@ trace_modes(const char *image)
 			unsigned xs = 0, ds = 0;
 
 			for (unsigned w = 0; words[w] != NULL; w++) want = want || strstr(name, words[w]) != NULL;
+			want = want || strstr(names[i], "HotBlack") != NULL;     /* (all of the black cover's) */
 			if (!want) continue;
 			method_getReturnType(methods[k], types, 2);
 			if (strchr("@cBqQiIlLsSvdf", types[0]) == NULL || args > 2 + 5) continue;
