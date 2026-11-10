@@ -1,10 +1,10 @@
 #!/bin/bash
-# The normal tvOS image with the hardware video decoder (VDEC=1): GPU, audio, SSH, Kodi and Minecraft as the box
-# usually runs. Builds out/twl-live-vdec.img; with "boot" also sends the box there (it must be in fastboot or tvOS).
+# The development tvOS image: the hardware video decoder (VDEC=1), GPU, audio, SSH, and on top of what a release
+# carries the crash logger in every application, the loader of diagnostic libraries and PineBoard's diagnostics. Builds out/twl-live-vdec.img; with "boot" also sends the box there (it must be in fastboot or tvOS).
 set -e
 cd "$(dirname "$0")/.."
-VDEC=1 GLAPPS="Kodi minecraftappletv YouTubeUnstable" \
-TVLIBS="twlhook:backboardd twlload:backboardd,mediaserverd,YouTubeUnstable,PineBoard,IdleScreen twlpb:PineBoard twlbt:TVSettings twlcrash:Kodi,minecraftappletv twlpad:minecraftappletv twlcloud:minecraftappletv twlpbdiag:PineBoard" \
+VDEC=1 \
+TVLIBS="${TVLIBS-twlhook:backboardd twlpb:PineBoard twlremote:PineBoard,HeadBoard twlbt:TVSettings twlcloud:@apps twlload:backboardd,mediaserverd,PineBoard,IdleScreen,@apps twlcrash:@apps twlpbdiag:PineBoard}" \
 VAR=1 SSH=1 CPUS=4 SECS=86400 KEYS=work/keys-none.list REST=1 TVAUDIO=1 \
 OSLOG="com.apple.wifid com.apple.Pineboard com.apple.bluetooth com.apple.mediaserverd" \
 ARGS="fbwidth=1920 fbheight=1080 usbkeys=1 cec=1 w2=6 w2bt=3 twl_monitor=0 hdmitx=1 mali=8 metal=1 gles=1 mali-pool=192 fb_flip=1 hdmiaudio=3 amlcpu=1 mali-clients=* msgbuf=4194304 ${EXTRA_ARGS-}" \

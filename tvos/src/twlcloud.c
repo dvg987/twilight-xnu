@@ -1,6 +1,7 @@
 /*
- * libtwlcloud.dylib: an iCloud account as far as an application's own CloudKit calls go, for a game that will not
- * start without one (Minecraft's Apple TV edition) on a box that has none. Injected into the program.
+ * libtwlcloud.dylib: an iCloud account as far as an application's own CloudKit calls go, for one that will not
+ * start without (Minecraft's Apple TV edition) on a box that has none. Injected into the applications the user
+ * installed; it does nothing in one that does not link CloudKit.
  *
  *   -[CKContainer accountStatusWithCompletionHandler:]       available
  *   -[CKContainer fetchUserRecordIDWithCompletionHandler:]   a record ID of its own ("_twl_local_user")
@@ -176,8 +177,8 @@ replace(const char *cls, const char *sel, IMP imp)
 __attribute__((constructor)) static void
 twlcloud_init(void)
 {
-	if (dlopen("/System/Library/Frameworks/CloudKit.framework/CloudKit", RTLD_NOW) == NULL) {
-		return;
+	if (objc_getClass("CKContainer") == NULL) {
+		return;         /* a program without CloudKit */
 	}
 	replace("CKContainer", "accountStatusWithCompletionHandler:", (IMP)my_account_status);
 	replace("CKContainer", "fetchUserRecordIDWithCompletionHandler:", (IMP)my_fetch_user_id);

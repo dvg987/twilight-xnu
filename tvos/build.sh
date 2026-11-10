@@ -11,9 +11,12 @@
 #      VDEC=1         the hardware H.264 decoder for VideoToolbox (and its boot-args optee=2 vdec=7)
 #      VAR=1          /private/var kept on the eMMC: emmc=2 var_hfs=emmc_darwin_data (the data volume, darwin from
 #                     4 GiB on: tools/twl-datavol.py, written once from the rescue Linux by tools/twl-datavol-write.py)
+#      USB=1          tvOS and /private/var on a USB stick instead (tools/twl-usb.py makes it): usbdisk=1
+#                     root_apfs=usb_darwin var_hfs=usb_darwin_data; the eMMC is not touched. USB=2: QEMU's xHCI
 #      JB=1           the package manager's prefix (tools/twl-jb.sh: work/twl-jb) in the image as /redwood/jb, for
-#                     init to copy to /var/jb on the data volume when it has none or another version (needs VAR=1;
+#                     init to copy to /var/jb on the data volume when it has none or another version (needs VAR=1 or USB;
 #                     ~43 MB more image, so leave it out once the prefix is there)
+#      NET=1          the network without SSH: configd and mDNSResponder for DHCP and names, en0 brought up
 #      SSH=1          sshd of the prefix as a launchd job (root, the key in work/ssh/authorized_keys, by default
 #                     ~/.ssh/id_ed25519.pub; host key work/ssh/ssh_host_ed25519_key, made once), configd and
 #                     mDNSResponder for DHCP and names, en0's address on the console (net_test), /bin/sh and friends
@@ -31,9 +34,11 @@ JOBS=${JOBS-"com.apple.notifyd com.apple.cfprefsd.xpc.daemon com.apple.logd com.
 	com.apple.distnoted.xpc.daemon com.apple.diagnosticd com.apple.fseventsd com.apple.containermanagerd
 	com.apple.runningboardd com.apple.backboardd com.apple.mobile.usermanagerd com.apple.mobilegestalt.xpc
 	com.apple.lsd com.apple.powerd com.apple.pluginkit.pkd com.apple.Pineboard com.apple.wifid"}
-[ -n "$SSH" ] && JOBS="$JOBS com.apple.configd com.apple.mDNSResponder"   # DHCP on en0 (IPConfiguration), DNS
-EMMC="emmc=1"
-[ -n "$VAR" ] && EMMC="emmc=2 var_hfs=emmc_darwin_data"
+[ -n "$SSH" ] && NET=1
+[ -n "$NET" ] && JOBS="$JOBS com.apple.configd com.apple.mDNSResponder"   # DHCP on en0 (IPConfiguration), DNS
+DISK="emmc=1 root_apfs=emmc_darwin"
+[ -n "$VAR" ] && DISK="emmc=2 var_hfs=emmc_darwin_data root_apfs=emmc_darwin"
+[ -n "$USB" ] && DISK="usbdisk=$USB root_apfs=usb_darwin var_hfs=usb_darwin_data"
 [ -n "$JB" ] && [ ! -f work/twl-jb/root/var/jb/.jb-version ] && { echo "build.sh: JB=1: run tools/twl-jb.sh first" >&2; exit 1; }
 
 rm -rf $O/root $O/boot
@@ -84,9 +89,10 @@ if [ -n "$SSH" ]; then
 	for c in sh bash zsh; do
 		ln -s /var/jb/bin/$c $O/boot/jb-bin/$c
 	done
-	cp tvos/jb/com.twilight.sshd.plist tvos/jb/com.twilight.net.plist tvos/jb/com.twilight.jbprep.plist $O/root/LaunchDaemons/
+	cp tvos/jb/com.twilight.sshd.plist tvos/jb/com.twilight.jbprep.plist $O/root/LaunchDaemons/
 	cp tvos/jb/jb-prep.sh $O/root/etc/jb-prep.sh
 fi
+[ -n "$NET" ] && cp tvos/jb/com.twilight.net.plist $O/root/LaunchDaemons/
 # JB=1: the prefix, for init to copy onto the data volume (hakios/userland/src/init.c, kept_prefix)
 if [ -n "$JB" ]; then
 	cp -a work/twl-jb/root/var/jb $O/root/jb
@@ -112,23 +118,32 @@ if [ -d work/metalbuild/out/NativeMaliMetal.bundle ]; then
 	mkdir -p $O/root/ext && cp -R work/metalbuild/out/NativeMaliMetal.bundle $O/root/ext/
 fi
 # the network to join at the start: its name, then its passphrase, one a line (never in the repository)
-[ -f work/w2fw/network ] && mkdir -p $O/root/fw && cp work/w2fw/network $O/root/fw/network
+NETWORK=${NETWORK-work/w2fw/network}       # NETWORK=FILE another one, NETWORK= none: joined from Settings
+[ -n "$NETWORK" ] && [ -f "$NETWORK" ] && mkdir -p $O/root/fw && cp "$NETWORK" $O/root/fw/network
 # our libraries inside tvOS programs (the kernel inserts them: init hands etc/inject.conf to kern.exec_inject).
 # Built against the iOS SDK, then marked tvOS (dyld refuses a library of another platform) and signed again.
 DYN="xnu-clang -arch arm64 -isysroot $THEOS/sdks/iPhoneOS16.5.sdk -O1"
 LDID=$THEOS/toolchain/linux/iphone/bin/ldid
 : > $O/root/etc/inject.conf
-for lib in ${TVLIBS-twlhook:backboardd twlpb:PineBoard twlbt:TVSettings}; do
+for lib in ${TVLIBS-twlhook:backboardd twlpb:PineBoard twlremote:PineBoard,HeadBoard twlbt:TVSettings twlcloud:@apps}; do
 	src=${lib%%:*}; progs=${lib#*:}
-	$DYN -dynamiclib -install_name /redwood/lib/lib$src.dylib -framework IOSurface -framework CoreFoundation -framework IOKit -lobjc -o $O/obj/lib$src.dylib tvos/src/$src.c
+	if [ -f tvos/src/$src.m ]; then
+		$DYN -fobjc-arc -dynamiclib -install_name /redwood/lib/lib$src.dylib -framework UIKit -framework CoreBluetooth -framework Foundation -framework QuartzCore -o $O/obj/lib$src.dylib tvos/src/$src.m
+	else
+		$DYN -dynamiclib -install_name /redwood/lib/lib$src.dylib -framework IOSurface -framework CoreFoundation -framework IOKit -lobjc -o $O/obj/lib$src.dylib tvos/src/$src.c
+	fi
 	python3 tools/macho-tvos.py $O/obj/lib$src.dylib
 	$LDID -S $O/obj/lib$src.dylib
 	cp $O/obj/lib$src.dylib $O/root/lib/
 	echo "/redwood/lib/lib$src.dylib ${progs//,/ }" >> $O/root/etc/inject.conf
 done
-# GLAPPS="Kodi ...": OpenGL ES by Mesa on the GPU (tvos/gpu/build-mesa-gl.sh) inside those apps. The libraries live on the box's /var
-# (tools/twl-gl-install.sh puts them there): 15 MB the image, which sits in memory, does not carry.
-[ -n "${GLAPPS-}" ] && echo "/var/mobile/gl/libhakios.gl.dylib $GLAPPS" >> $O/root/etc/inject.conf
+# OpenGL ES by Mesa on the GPU (tvos/gpu/build-mesa-gl.sh) in every application the user installed ("@apps": the
+# kernel's word for a program in a .app under /var). The layer takes over EAGLContext and leaves a program without
+# that class alone. GL=0 leaves it out (15 MB less image).
+if [ "${GL-1}" != 0 ] && [ -f work/glbuild/out/libhakios.gl.dylib ]; then
+	cp work/glbuild/out/libhakios.gl.dylib work/glbuild/out/libOSMesa.8.dylib $O/root/lib/
+	echo "/redwood/lib/libhakios.gl.dylib @apps" >> $O/root/etc/inject.conf
+fi
 # programs of ours that are tvOS programs (dyld, libSystem): built the same way
 for prog in bluetool metaltest; do
 	$DYN -o $O/obj/$prog tvos/src/$prog.c
@@ -136,8 +151,8 @@ for prog in bluetool metaltest; do
 	$LDID -S -Cadhoc $O/obj/$prog          # (ad hoc: what the kernel's AMFI stand-in takes for a platform binary)
 	cp $O/obj/$prog $O/root/bin/
 done
-# SSH=1: the phone's net_test, for en0's address (com.twilight.net)
-if [ -n "$SSH" ]; then
+# NET=1: the phone's net_test, which brings en0 up and says its address (com.twilight.net)
+if [ -n "$NET" ]; then
 	$DYN -fobjc-arc -framework Foundation -framework SystemConfiguration -o $O/obj/net_test $H/src/net_test.m
 	python3 tools/macho-tvos.py $O/obj/net_test
 	$LDID -S -Cadhoc $O/obj/net_test
@@ -157,7 +172,8 @@ fi
 # the hardware H.264 decoder (VDEC=1): tvos/src/twlvdec.c as /System/Library/VideoDecoders/AVD.videodecoder (the image's
 # vdecoders/, which init puts over the volume's directory), the name VideoToolbox loads in every process and calls
 # AVDRegister in. It drives /dev/twl-vdec-probe, which the kernel has with optee=2 vdec=7; one decoder at a time, the
-# others fall back to software. Kodi also gets tvos/src/twlcvgl.c: CoreVideo's GL texture import needs Apple's GPU.
+# others fall back to software. With it comes tvos/src/twlcvgl.c, in the applications that get Mesa's OpenGL ES:
+# CoreVideo's own GL texture import needs Apple's GPU.
 if [ -n "${VDEC-}" ]; then
 	mkdir -p $O/root/vdecoders
 	$DYN -Wall -Wno-pointer-sign -Ihakios/xnu/files/bsd -dynamiclib \
@@ -172,7 +188,7 @@ if [ -n "${VDEC-}" ]; then
 	done
 	cp $O/obj/AVD.videodecoder $O/root/vdecoders/
 	cp $O/obj/libtwlcvgl.dylib $O/root/lib/
-	echo "/redwood/lib/libtwlcvgl.dylib Kodi" >> $O/root/etc/inject.conf
+	echo "/redwood/lib/libtwlcvgl.dylib @apps" >> $O/root/etc/inject.conf
 	ARGS="$ARGS optee=2 optee_delay=10 vdec=7 vdec_delay=25"
 fi
 # bluetoothd, one instruction changed: every pairing agent registers as one that answers pairing requests itself
@@ -226,4 +242,4 @@ python3 hakios/tools/apfs/mkapfs.py -z -o $O/root.apfs redwood=$O/root | tail -1
 python3 hakios/tools/apfs/mkapfs.py -o $O/boot.apfs Boot=$O/boot | tail -1
 python3 hakios/xnuloader/mkpayload.py -o ${PAYLOAD:-out/payload-tvos.bin} kernel=hakios/hakios-kernel \
 	ramdisk=$O/boot.apfs ramdisk1=$O/root.apfs --no-version \
-	--cmdline "cpus=${CPUS:-3} $EMMC root_apfs=emmc_darwin loader_return_after=${SECS:-180} epoch=$(date +%s) twl_hang=${HANG:-90} $ARGS"
+	--cmdline "cpus=${CPUS:-3} $DISK loader_return_after=${SECS:-180} epoch=$(date +%s) twl_hang=${HANG:-90} $ARGS"

@@ -56,6 +56,7 @@ extern char _start[], _image_end[];
 #define PSCI_SYSTEM_OFF     0x84000008u
 #define PSCI_SYSTEM_RESET   0x84000009u
 #define AML_REASON_BOOTLOADER 7                         /* back into U-Boot's fastboot, RAM kept */
+#define AML_REASON_NORMAL   1                           /* an ordinary restart: U-Boot's bootcmd */
 
 struct boot_video { u64 v_baseAddr, v_display, v_rowBytes, v_width, v_height, v_depth; };
 struct boot_args {
@@ -403,14 +404,19 @@ save_screen(void)
 	}
 }
 
-/* Back to the firmware: on the box into fastboot with RAM kept, under QEMU off. */
+static int restart_normal;      /* twl_restart=1 */
+
+/*
+ * Back to the firmware: on the box into fastboot with RAM kept -- or, with twl_restart=1 (a system started from a
+ * stick by U-Boot itself), an ordinary restart, which starts it again --, under QEMU off.
+ */
 static void __attribute__((noreturn))
 finish(void)
 {
 	save_screen();
 	dcache_clean((u64)MB, (u64)MB + MBOX_SIZE);
 	if (P->monitor) {
-		psci(PSCI_SYSTEM_RESET, AML_REASON_BOOTLOADER, 0, 0);
+		psci(PSCI_SYSTEM_RESET, restart_normal ? AML_REASON_NORMAL : AML_REASON_BOOTLOADER, 0, 0);
 	} else {
 		psci(PSCI_SYSTEM_OFF, 0, 0, 0);
 	}
@@ -1507,6 +1513,7 @@ twl_main(u64 fdt_pa, u64 image_base)
 	u64 self = read_mpidr() & 0xffffff;
 	int ncpus = 0;
 	int monitor_core = P->monitor && !cmdline_has(pl.cmdline, "twl_monitor=0");
+	restart_normal = cmdline_has(pl.cmdline, "twl_restart=1");
 	dt_begin(&w, "cpus");
 	for (int pass = 0; pass < 2; pass++) {
 		for (int core = 0; core < P->cores; core++) {
