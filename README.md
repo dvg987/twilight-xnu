@@ -1,10 +1,8 @@
 # twilight-xnu
 
-tvOS 16.5 on the Xiaomi Mi Box S 3rd gen (Amlogic S905X5M, board `s7d_twilight`), started from a USB stick by the
-box's own U-Boot. With the stick out, the box starts Android as before.
+tvOS 16.5 on the Xiaomi Mi Box S 3rd gen (Amlogic S905X5M, `s7d_twilight`), started from USB or from eMMC.
 
-No Apple software is distributed. You build the stick from your own copy of the tvOS 16.5 OTA for AppleTV6,2
-(20L563).
+No Apple software is distributed. You should build the stick from your own copy of the tvOS 16.5 OTA for Apple TV 4k (1st Gen).
 
 | | |
 |---|---|
@@ -18,19 +16,19 @@ No Apple software is distributed. You build the stick from your own copy of the 
 | Hardware video decoding | HEVC, VP9 and H.264 in 1080p and 4K. HDR10 for HEVC and VP9. |
 | Video mode switching | The output switches between SDR and HDR and between refresh rates. |
 | SDR to HDR | SDR content can be shown in an HDR video mode. |
-| Video plane | Decoded frames are sent straight to the display. |
-| Multichannel audio | E-AC-3 is decoded and sent to the TV as multichannel PCM over HDMI. |
-| Wi-Fi | Works, at the expected speed. |
-| Bluetooth | The Mi remote is paired from a setup screen; other remotes in Settings. |
+| Video plane | Decoded frames are sent directly to the display. |
+| Multichannel audio | EAC-3 can be decoded and sent to the TV as multichannel PCM. |
+| Wi-Fi | Works, at the same speeds as stock Android. |
+| Bluetooth | The Mi remote cam be paired from the setup screen, and all of It's buttons are mapped. |
 | HDMI-CEC | The TV's remote works, and tvOS can put the TV to sleep. |
-| Sleep mode | The box goes to sleep and wakes again. |
+| Sleep mode | The box can sleep and wake. |
 | CPU and GPU scheduling | Scheduling and throttling for the CPU and the GPU. |
 
 Tested apps: Kodi, YouTube and Minecraft: Apple TV Edition.
 
 ## Known issues
 
-- The home screen is a bit laggy. The box has a 1-core GPU, compared to the 12-core GPU of the A10X.
+- The home screen is a bit laggy. The box has a 1-core GPU, compared to the 12-core GPU of the A10X Fusion on the Apple TV 4k.
 - Video playing while an overlay is on top of it may be laggy, as with Apple's Aerial screensaver.
 - A playing video may glitch during its resize animation, as in YouTube when its settings open.
 
@@ -48,8 +46,7 @@ Tested apps: Kodi, YouTube and Minecraft: Apple TV Edition.
 
 1. You need the box with an unlocked bootloader, a USB stick of 8 GB or more, and your own tvOS 16.5 OTA.
 2. Build the kernel, the loader and the tvOS system volume, then write the stick with `tools/twl-release.sh`.
-3. Put the stick in and start the box. The first start asks for a remote, if the TV's does not work over
-   HDMI-CEC, and then for the language.
+3. Run `adb reboot update` from adb, then put the stick in and start the box.
 
 Nothing on the eMMC is written except one variable of U-Boot's environment (`bootcmd`).
 
